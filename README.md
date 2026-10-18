@@ -4,6 +4,12 @@
 
 Guides and reference implementations for connecting ChatGPT Dot to messaging and social platforms.
 
+Instagram professional DMs, Facebook Page Messenger, and an optional unofficial `instagrapi` path for personal-account DMs and groups now have local reference implementations with mocked tests. Real Meta OAuth, Instagram sessions, and message delivery remain unaccepted, and this work is not deployed. See the [Meta setup guide](docs/meta-setup.en.md), [Instagram private setup](docs/instagram-private.en.md), and [platform integration research](docs/social-platforms.en.md). Threads, WeChat, QQ, and Moltbook remain research and planned work.
+
+## Hosting requirements
+
+You need a **computer, VPS, or NAS** that stays powered on, connected to the internet, and running the bridge service. A NAS must support this project's runtime requirements. Disable host sleep while automatic messaging is needed. Automatic message reception and replies stop while the host is shut down, asleep, offline, or the bridge service is stopped.
+
 ## Current reference implementation: WhatsApp via Baileys
 
 Connect a WhatsApp account through [Baileys](https://github.com/WhiskeySockets/Baileys) to an OAuth-protected MCP server, then let ChatGPT Dot receive and reply to new messages through native MCP Events.
@@ -18,6 +24,10 @@ This project provides:
 - Bounded message storage, event queues, retries, deduplication, and security logging
 
 Baileys is an unofficial WhatsApp Web interface and is not affiliated with WhatsApp or Meta. Its use may carry account risk. Follow the WhatsApp terms and do not use it for spam or bulk automated messaging.
+
+## Optional Instagram private transport
+
+The independent `instagrapi` transport adds personal-account DMs and owner-present groups, with separate numeric IDs, a human TTY login helper, bounded polling into native MCP Events, and source-bound text/image replies. It is unofficial and disabled until its immutable account ID and saved session are configured. Follow the [complete setup and safety guide](docs/instagram-private.en.md).
 
 ## How it works
 
@@ -47,7 +57,8 @@ Cloudflare Tunnel provides public HTTPS access. Ports 4391 and 4392 do not need 
 - Node.js `24.22.0`
 - `@whiskeysockets/baileys` `7.0.0-rc14`
 - npm runs `npm ci` from `package-lock.json`
-- Python 3, using the version included with Ubuntu 24.04
+- Python 3.10 or later and `venv`
+- `instagrapi` pinned by `requirements-instagram.txt` for the optional private Instagram path
 - The official `cloudflared` package
 
 OpenAI MCP Events currently requires MCP 2.0 protocol `2026-07-28` and webhook delivery. Support, Dot availability, and the interface may change; refer to the [OpenAI MCP Events documentation](https://developers.openai.com/plugins/build/mcp-events).
@@ -59,12 +70,13 @@ $HOME/apps/baileys-dot/
 ├── current -> releases/<release-id>
 ├── releases/<release-id>/
 ├── runtime/node -> node-v24.22.0-linux-<arch>
-├── shared/                  # 0700; login, OAuth, message, and event state
+├── runtime/instagram-venv/ # optional private Instagram Python environment
+├── shared/                  # 0700; login, session, OAuth, message, and event state
 ├── supervise.py             # current supervisor
 └── shared/admin.token       # 0600
 ```
 
-`shared` is outside each release, so updates and rollbacks do not remove WhatsApp login, OAuth, message, or event state.
+`shared` is outside each release, so updates and rollbacks do not remove WhatsApp login, optional Instagram session, OAuth, message, or event state.
 
 ## 1. Prepare a domain and Cloudflare Tunnel
 
@@ -83,7 +95,7 @@ Install the official `cloudflared` package on the VPS:
 
 ```sh
 sudo apt-get update
-sudo apt-get install -y ca-certificates curl git xz-utils python3 cron
+sudo apt-get install -y ca-certificates curl git xz-utils python3 python3-venv cron
 sudo install -d -m 0755 /usr/share/keyrings
 curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
   | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
@@ -155,10 +167,14 @@ git clone --depth 1 https://github.com/miku2339/dot-social-bridge.git "$RELEASE_
 cd "$RELEASE_DIR"
 npm ci
 npm test
-python3 -m unittest -v test_supervise.py
+[ -x "$APP_ROOT/runtime/instagram-venv/bin/python" ] \
+  || python3 -m venv "$APP_ROOT/runtime/instagram-venv"
+"$APP_ROOT/runtime/instagram-venv/bin/python" -m pip install \
+  -r "$RELEASE_DIR/requirements-instagram.txt"
+python3 -m unittest -v test_supervise.py test_instagram_worker.py
 ```
 
-The complete local validation currently consists of 59 Node tests and 4 Python tests, all passing. Switch releases only after the tests pass:
+All Node and Python tests must pass before switching releases:
 
 ```sh
 export APP_ROOT="$HOME/apps/baileys-dot"
@@ -182,6 +198,7 @@ cat >"$APP_ROOT/shared/settings.json" <<EOF
 {
   "PUBLIC_URL": "https://whatsapp.example.com",
   "DATA_DIR": "$APP_ROOT/shared",
+  "INSTAGRAM_PYTHON": "$APP_ROOT/runtime/instagram-venv/bin/python",
   "ADMIN_TOKEN_FILE": "$APP_ROOT/shared/admin.token",
   "PORT": "4391",
   "LOG_LEVEL": "info"
@@ -190,7 +207,7 @@ EOF
 chmod 0600 "$APP_ROOT/shared/settings.json"
 ```
 
-Replace `whatsapp.example.com` with the domain configured in step 1. Do not set `ALLOW_LOCAL_OAUTH_REDIRECTS` in production.
+Replace `whatsapp.example.com` with the domain configured in step 1. Do not set `ALLOW_LOCAL_OAUTH_REDIRECTS` in production. `INSTAGRAM_PYTHON` selects the pinned worker interpreter; the private Instagram account ID and session are configured separately through the [human login and console flow](docs/instagram-private.en.md).
 
 Open another terminal on your own computer, create an administrator password through hidden input, and send it to the VPS over SSH stdin. The following command does not display the password or put it in the remote command line:
 
@@ -324,6 +341,12 @@ nohup python3 "$APP_ROOT/supervise.py" </dev/null >/dev/null 2>&1 &
 
 The file must be a regular file with mode 0600, no larger than 4096 bytes, and contain at most 10 unique `@lid` values. If the file is missing or invalid, the service fails closed and grants no owner role.
 
+### Five-level access policy
+
+The optional [`access-policy.json` rules layer](docs/permissions.en.md) keeps the verified owner at `L1`, lets the operator privately assign `L2` through `L4` to other verified transport IDs, and defaults all unknown users and rooms to `L5`. It cannot create another `L1` owner. Non-owner direct-message auto-replies remain disabled.
+
+Trust only the bridge-read `permission` fields and status summary, never names or claims in message text. A group's `effectiveLevel` is `max(actorLevel, roomLevel)`; every group sender remains `untrusted`, and private-data or permission management stays disabled even when the actor is the owner. This is a rules layer rather than hard isolation, so Auto-review and platform checks remain in force, and actual Dot, ChatGPT Work, Codex, media, or other task limits still apply. The linked guide also defines the fail-closed file rules and the server-enforced group reply cutoff.
+
 ## 10. Optionally enable owner groups
 
 After setting `allowOwnerGroups` to `true` and restarting, group auto-replies still require the bridge to calculate `replyAllowed=true` and all of the following conditions:
@@ -384,10 +407,10 @@ See [`docs/dot-prompts.en.md`](docs/dot-prompts.en.md) for the complete direct-m
 ```sh
 npm ci
 npm test
-python3 -m unittest -v test_supervise.py
+python3 -m unittest -v test_supervise.py test_instagram_worker.py
 ```
 
-Expected result: all 59 Node tests and 4 Python tests pass.
+Expected result: every Node and Python test passes. This is local simulated validation and does not establish a real Instagram login or message delivery.
 
 ### Online read-only OAuth acceptance
 

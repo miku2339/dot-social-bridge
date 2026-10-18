@@ -4,6 +4,14 @@ import { constants } from 'node:fs'
 import { chmod, mkdir, open, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 
+import {
+  accessPolicyRevision,
+  loadAccessPolicy,
+  normalizeTransportJid,
+  permissionForMessage,
+  persistAccessPolicy
+} from './access-policy.mjs'
+
 const STORE_VERSION = 1
 const STATUS_BROADCAST = 'status@broadcast'
 const USER_JID = /^[1-9]\d{4,19}@s\.whatsapp\.net$/
@@ -38,6 +46,53 @@ function parseLimit(value, fallback, max) {
     throw new TypeError(`limit must be an integer between 1 and ${max}`)
   }
   return limit
+}
+
+function consoleError(message, status = 400) {
+  const error = new Error(message)
+  error.status = status
+  return error
+}
+
+function normalizeConsoleWhatsAppId(value) {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (/^\+?[1-9]\d{4,19}$/.test(trimmed)) return `${trimmed.replace(/^\+/, '')}@s.whatsapp.net`
+  const jid = normalizeTransportJid(trimmed)
+  return jid && !GROUP_JID.test(jid) ? jid : null
+}
+
+function consoleProfile(user) {
+  if (!user || typeof user !== 'object' || Array.isArray(user)) throw consoleError('user is required')
+  const keys = Object.keys(user)
+  if (keys.some((key) => !['displayName', 'id', 'instagramUsername', 'level', 'whatsappId'].includes(key))) {
+    throw consoleError('user contains unknown fields')
+  }
+  const whatsappId = normalizeConsoleWhatsAppId(user.whatsappId)
+  if (!whatsappId) throw consoleError('whatsappId must be a phone number or WhatsApp user JID')
+  if (!['L2', 'L3', 'L4', 'L5'].includes(user.level)) throw consoleError('level must be L2, L3, L4, or L5')
+  if (
+    typeof user.displayName !== 'string'
+    || user.displayName.trim().length < 1
+    || user.displayName.trim().length > 100
+    || Buffer.byteLength(user.displayName.trim()) > 512
+    || /[\u0000-\u001f\u007f]/.test(user.displayName)
+  ) throw consoleError('displayName is invalid')
+  if (user.instagramUsername !== undefined && user.instagramUsername !== null && (
+    typeof user.instagramUsername !== 'string'
+    || user.instagramUsername.trim().length > 128
+    || /[\u0000-\u001f\u007f]/.test(user.instagramUsername)
+  )) throw consoleError('instagramUsername is invalid')
+  return {
+    hasId: user.id !== undefined,
+    id: user.id === undefined ? null : normalizeConsoleWhatsAppId(user.id),
+    whatsappId,
+    displayName: user.displayName.trim(),
+    instagramUsername: typeof user.instagramUsername === 'string' && user.instagramUsername.trim().length > 0
+      ? user.instagramUsername.trim()
+      : null,
+    level: user.level
+  }
 }
 
 function toTimestampMs(value) {
@@ -461,9 +516,13 @@ async function loadOwnerIdentities(file) {
 }
 
 function senderRoleForMessage(message, ownerIds) {
-  return message?.fromMe === false
-    && message.chatId === message.senderId
-    && ownerIds.has(message.senderId)
+  const chatId = normalizeIdentityJid(message?.chatId)
+  const senderId = normalizeIdentityJid(message?.senderId)
+  return message?.direction === 'incoming'
+    && message?.fromMe === false
+    && chatId !== null
+    && chatId === senderId
+    && ownerIds.has(senderId)
     ? 'owner'
     : 'untrusted'
 }
@@ -646,6 +705,7 @@ export class WhatsAppBridge extends EventEmitter {
     this.dataDir = resolve(dataDir)
     this.authDir = join(this.dataDir, 'auth')
     this.ownerIdentitiesFile = join(this.dataDir, 'owner-identities.json')
+    this.accessPolicyFile = join(this.dataDir, 'access-policy.json')
     this.logger = logger
     this.maxMessages = maxMessages
     this.retentionDays = retentionDays
@@ -671,7 +731,17 @@ export class WhatsAppBridge extends EventEmitter {
     this.mutationQueue = Promise.resolve()
     this.sendQueue = Promise.resolve()
     this.authSaveQueue = Promise.resolve()
+    this.consoleMutationQueue = Promise.resolve()
     this.ownerIdentities = unconfiguredOwnerIdentities()
+    this.accessPolicy = {
+      valid: true,
+      userLevels: new Map(),
+      userProfiles: new Map(),
+      roomLevels: new Map(),
+      autoReplyEnabled: true,
+      groupRepliesAfter: null,
+      privateRepliesAfter: null
+    }
     this.groupMetadataCache = new Map()
     this.botIdentityIds = new Set()
   }
@@ -686,6 +756,7 @@ export class WhatsAppBridge extends EventEmitter {
       await mkdir(this.authDir, { recursive: true, mode: 0o700 })
       await chmod(this.authDir, 0o700)
       this.ownerIdentities = await loadOwnerIdentities(this.ownerIdentitiesFile)
+      this.accessPolicy = await loadAccessPolicy(this.accessPolicyFile, this.ownerIdentities.ownerIds)
       const storeMigrated = await this.store.load()
       if (storeMigrated) await this.store.persist()
       await this._loadDependencies()
@@ -719,7 +790,7 @@ export class WhatsAppBridge extends EventEmitter {
     } catch (error) {
       this._logError('Failed to close WhatsApp socket cleanly', error)
     }
-    await Promise.allSettled([this.mutationQueue, this.sendQueue, this.authSaveQueue])
+    await Promise.allSettled([this.mutationQueue, this.sendQueue, this.authSaveQueue, this.consoleMutationQueue])
     return this.getStatus()
   }
 
@@ -733,12 +804,148 @@ export class WhatsAppBridge extends EventEmitter {
         count: this.ownerIdentities.ownerIds.size,
         directMessagesOnly: true,
         allowOwnerGroups: this.ownerIdentities.allowOwnerGroups
+      },
+      permissions: {
+        mode: 'rules_only',
+        valid: this.accessPolicy.valid,
+        defaultLevel: 'L5',
+        ownerLevel: 'L1',
+        groupRepliesAfter: this.accessPolicy.groupRepliesAfter
       }
     }
   }
 
   getQr() {
     return this.qr
+  }
+
+  getConsoleState() {
+    const users = [
+      ...[...this.ownerIdentities.ownerIds].sort().map((id) => ({
+        id,
+        displayName: id,
+        whatsappId: id,
+        instagramUsername: null,
+        isOwner: true,
+        level: 'L1',
+        identityState: 'owner_configured'
+      })),
+      ...[...this.accessPolicy.userLevels.entries()]
+        .filter(([id]) => !this.ownerIdentities.ownerIds.has(id))
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([id, level]) => {
+          const profile = this.accessPolicy.userProfiles.get(id)
+          return {
+            id,
+            displayName: profile?.displayName ?? id,
+            whatsappId: id,
+            instagramUsername: profile?.instagramUsername ?? null,
+            isOwner: false,
+            level,
+            identityState: 'configured'
+          }
+        })
+    ]
+    const groupIds = new Set([
+      ...this.accessPolicy.roomLevels.keys(),
+      ...this.ownerIdentities.mentionOnlyGroupIds,
+      ...Object.keys(this.store.data.chats).filter((id) => GROUP_JID.test(id))
+    ])
+    const groups = [...groupIds].sort().map((id) => ({
+      id,
+      name: this.store.data.chats[id]?.name ?? null,
+      level: this.accessPolicy.roomLevels.get(id) ?? 'L5',
+      mentionOnly: this.ownerIdentities.mentionOnlyGroupIds.has(id)
+    }))
+    return {
+      channels: {
+        whatsapp: {
+          status: this.status,
+          paired: this.paired,
+          account: this.account ? { ...this.account } : null,
+          autoReplyEnabled: this.accessPolicy.autoReplyEnabled,
+          ownerGroupsAllowed: this.ownerIdentities.allowOwnerGroups,
+          mentionOnlyGroupIds: [...this.ownerIdentities.mentionOnlyGroupIds].sort()
+        },
+        instagram: { status: 'not_configured', available: false }
+      },
+      permissions: {
+        valid: this.accessPolicy.valid,
+        defaultLevel: 'L5',
+        mode: 'rules_only'
+      },
+      users,
+      groups,
+      revision: accessPolicyRevision(this.accessPolicy)
+    }
+  }
+
+  async updateConsoleSettings(settings = {}) {
+    const operation = this.consoleMutationQueue.then(() => this._updateConsoleSettingsLocked(settings))
+    this.consoleMutationQueue = operation.catch(() => {})
+    return operation
+  }
+
+  async _updateConsoleSettingsLocked({ revision, action, user, userId, enabled, chatId, level } = {}) {
+    if (!this.started) throw consoleError('WhatsApp bridge is not started', 503)
+    if (!this.accessPolicy.valid) throw consoleError('Access policy is invalid', 409)
+    if (typeof revision !== 'string' || revision !== accessPolicyRevision(this.accessPolicy)) {
+      throw consoleError('Console state revision conflict', 409)
+    }
+    const next = {
+      ...this.accessPolicy,
+      userLevels: new Map(this.accessPolicy.userLevels),
+      userProfiles: new Map([...this.accessPolicy.userProfiles].map(([id, profile]) => [id, { ...profile }])),
+      roomLevels: new Map(this.accessPolicy.roomLevels)
+    }
+
+    if (action === 'save-user') {
+      const profile = consoleProfile(user)
+      if (profile.hasId && profile.id === null) throw consoleError('user.id is invalid')
+      if (this.ownerIdentities.ownerIds.has(profile.id) || this.ownerIdentities.ownerIds.has(profile.whatsappId)) {
+        throw consoleError('Owner identity cannot be changed', 403)
+      }
+      if (profile.hasId) {
+        if (!next.userLevels.has(profile.id)) throw consoleError('Configured user was not found', 404)
+        if (profile.id !== profile.whatsappId) throw consoleError('WhatsApp identity is immutable', 409)
+      } else if (next.userLevels.has(profile.whatsappId)) {
+        throw consoleError('Configured user already exists', 409)
+      }
+      next.userLevels.set(profile.whatsappId, profile.level)
+      next.userProfiles.set(profile.whatsappId, {
+        displayName: profile.displayName,
+        instagramUsername: profile.instagramUsername
+      })
+    } else if (action === 'delete-user') {
+      const id = normalizeConsoleWhatsAppId(userId)
+      if (!id) throw consoleError('userId is invalid')
+      if (this.ownerIdentities.ownerIds.has(id)) throw consoleError('Owner identity cannot be deleted', 403)
+      if (!next.userLevels.has(id)) throw consoleError('Configured user was not found', 404)
+      next.userLevels.delete(id)
+      next.userProfiles.delete(id)
+    } else if (action === 'set-replies') {
+      if (typeof enabled !== 'boolean') throw consoleError('enabled must be a boolean')
+      if (enabled && !next.autoReplyEnabled) {
+        const activation = Date.now()
+        next.groupRepliesAfter = activation
+        next.privateRepliesAfter = activation
+      }
+      next.autoReplyEnabled = enabled
+    } else if (action === 'save-group') {
+      const id = normalizeTransportJid(chatId)
+      if (!id || !GROUP_JID.test(id)) throw consoleError('chatId must be a WhatsApp group JID')
+      if (!['L2', 'L3', 'L4', 'L5'].includes(level)) throw consoleError('level must be L2, L3, L4, or L5')
+      next.roomLevels.set(id, level)
+    } else {
+      throw consoleError('Unknown console action')
+    }
+
+    this.accessPolicy = await persistAccessPolicy(
+      this.accessPolicyFile,
+      next,
+      this.ownerIdentities.ownerIds
+    )
+    return this.getConsoleState()
   }
 
   listChats({ limit = 50 } = {}) {
@@ -888,12 +1095,19 @@ export class WhatsAppBridge extends EventEmitter {
     if (scope !== 'groups') throw new TypeError('scope must be groups')
     if (!Number.isSafeInteger(after) || after < 1) throw new TypeError('after must be a positive epoch millisecond integer')
     const parsedLimit = parseLimit(limit, 20, 20)
-    if (!this.ownerIdentities.valid || !this.ownerIdentities.allowOwnerGroups) return []
+    if (
+      !this.ownerIdentities.valid
+      || !this.ownerIdentities.allowOwnerGroups
+      || !this.accessPolicy.valid
+      || !this.accessPolicy.autoReplyEnabled
+    ) return []
+
+    const effectiveAfter = Math.max(after, this.accessPolicy.groupRepliesAfter ?? after)
 
     this._refreshBotIdentitySeeds()
     this.botIdentityIds = await this._identityAliases(this.botIdentityIds)
     const candidates = this.store.data.messages
-      .filter((message) => GROUP_JID.test(message.chatId) && message.timestamp > after && message.fromMe === false)
+      .filter((message) => GROUP_JID.test(message.chatId) && message.timestamp > effectiveAfter && message.fromMe === false)
       .sort((a, b) => a.timestamp - b.timestamp)
       .filter((message) => {
         const view = this._messageView(message, { groupAllowed: false })
@@ -916,7 +1130,11 @@ export class WhatsAppBridge extends EventEmitter {
         if (pending.length >= parsedLimit) break
       }
     }
-    return pending
+    if (!this.accessPolicy.valid || !this.accessPolicy.autoReplyEnabled) return []
+    const currentCutoff = this.accessPolicy.groupRepliesAfter
+    return currentCutoff === null
+      ? pending
+      : pending.filter((message) => message.timestamp > currentCutoff)
   }
 
   async sendText({ chatId, text, idempotencyKey } = {}) {
@@ -1009,10 +1227,10 @@ export class WhatsAppBridge extends EventEmitter {
     )) {
       throw new Error('idempotencyKey was already used with a different request')
     }
+    if (entry?.status === 'sent') return entry.messageId
     const isAutomaticReply = idempotencyKey.startsWith('dot-auto:')
     let source
     if (isAutomaticReply) source = await this._validateAutomaticReply(chatId, idempotencyKey, false)
-    if (entry?.status === 'sent') return entry.messageId
     if (isAutomaticReply) source = await this._validateAutomaticReply(chatId, idempotencyKey, true)
 
     if (!entry) {
@@ -1030,6 +1248,7 @@ export class WhatsAppBridge extends EventEmitter {
       })
     }
 
+    if (isAutomaticReply) this._validateAutomaticReplyPolicy(source, chatId)
     const sent = await this.socket.sendMessage(chatId, { text }, {
       messageId: entry.messageId,
       ...(source ? { quoted: quotedIncomingMessage(source) } : {})
@@ -1070,10 +1289,10 @@ export class WhatsAppBridge extends EventEmitter {
     )) {
       throw new Error('idempotencyKey was already used with a different request')
     }
+    if (entry?.status === 'sent') return entry.messageId
     const isAutomaticReply = idempotencyKey.startsWith('dot-auto:')
     let source
     if (isAutomaticReply) source = await this._validateAutomaticReply(chatId, idempotencyKey, false)
-    if (entry?.status === 'sent') return entry.messageId
     if (isAutomaticReply) source = await this._validateAutomaticReply(chatId, idempotencyKey, true)
 
     if (!entry) {
@@ -1094,6 +1313,7 @@ export class WhatsAppBridge extends EventEmitter {
       })
     }
 
+    if (isAutomaticReply) this._validateAutomaticReplyPolicy(source, chatId)
     const sent = await this.socket.sendMessage(chatId, { image, mimetype, caption }, {
       messageId: entry.messageId,
       ...(source ? { quoted: quotedIncomingMessage(source) } : {})
@@ -1130,10 +1350,10 @@ export class WhatsAppBridge extends EventEmitter {
     )) {
       throw new Error('idempotencyKey was already used with a different request')
     }
+    if (entry?.status === 'sent') return entry.messageId
     const isAutomaticReply = idempotencyKey.startsWith('dot-auto:')
     let source
     if (isAutomaticReply) source = await this._validateAutomaticReply(chatId, idempotencyKey, false)
-    if (entry?.status === 'sent') return entry.messageId
     if (isAutomaticReply) source = await this._validateAutomaticReply(chatId, idempotencyKey, true)
 
     if (!entry) {
@@ -1159,6 +1379,7 @@ export class WhatsAppBridge extends EventEmitter {
     const content = kind === 'video'
       ? { video: media, mimetype, caption, ...(seconds === null ? {} : { seconds }) }
       : { document: media, mimetype, fileName, caption }
+    if (isAutomaticReply) this._validateAutomaticReplyPolicy(source, chatId)
     const sent = await this.socket.sendMessage(chatId, content, {
       messageId: entry.messageId,
       ...(source ? { quoted: quotedIncomingMessage(source) } : {})
@@ -1195,6 +1416,7 @@ export class WhatsAppBridge extends EventEmitter {
       replyAllowed: ignoredReplyAllowed,
       repliesToBot: ignoredRepliesToBot,
       senderRole: ignoredSenderRole,
+      permission: ignoredPermission,
       ...publicMessage
     } = message
     const autoReply = this.store.data.idempotency[`dot-auto:${message.id}`]
@@ -1205,9 +1427,11 @@ export class WhatsAppBridge extends EventEmitter {
     const replyAddressed = isGroup && this._groupMessageAddressesBot(message.chatId, message)
     const allowedGroup = isGroup && (groupAllowed ?? this._cachedGroupAllowed(message.chatId) ?? false)
     const incoming = message.direction === 'incoming' && message.fromMe === false
+    const permission = permissionForMessage(message, this.accessPolicy, this.ownerIdentities.ownerIds)
     return {
       ...publicMessage,
       senderRole,
+      permission,
       autoReplySent: autoReply?.status === 'sent' && autoReply.chatId === message.chatId,
       groupAllowed: allowedGroup,
       mentionsBot,
@@ -1338,6 +1562,7 @@ export class WhatsAppBridge extends EventEmitter {
       && message.fromMe === false
     ))
     if (!source) throw new Error('dot-auto idempotencyKey does not reference an incoming message in this chat')
+    this._validateAutomaticReplyPolicy(source, chatId)
     if (!GROUP_JID.test(chatId)) {
       if (senderRoleForMessage(source, this.ownerIdentities.ownerIds) !== 'owner') {
         throw new Error('dot-auto source is not an owner direct message')
@@ -1347,6 +1572,7 @@ export class WhatsAppBridge extends EventEmitter {
 
     this._refreshBotIdentitySeeds()
     this.botIdentityIds = await this._identityAliases(this.botIdentityIds)
+    this._validateAutomaticReplyPolicy(source, chatId)
     const addressesBot = this._groupMessageAddressesBot(chatId, source)
     if (!this.ownerIdentities.valid || !this.ownerIdentities.allowOwnerGroups || !addressesBot) {
       throw new Error('dot-auto source is not an allowed group mention or reply')
@@ -1354,7 +1580,21 @@ export class WhatsAppBridge extends EventEmitter {
     if (requireFreshGroup && !(await this._getGroupAccess(chatId, { fresh: true }))) {
       throw new Error('dot-auto group is not currently allowed')
     }
+    this._validateAutomaticReplyPolicy(source, chatId)
     return source
+  }
+
+  _validateAutomaticReplyPolicy(source, chatId) {
+    if (!this.accessPolicy.valid) throw new Error('dot-auto access policy is invalid')
+    if (!this.accessPolicy.autoReplyEnabled) throw new Error('Automatic replies are paused')
+    const cutoff = GROUP_JID.test(chatId)
+      ? this.accessPolicy.groupRepliesAfter
+      : this.accessPolicy.privateRepliesAfter
+    if (cutoff !== null && source.timestamp <= cutoff) {
+      throw new Error(GROUP_JID.test(chatId)
+        ? 'dot-auto source predates the group reply cutoff'
+        : 'dot-auto source predates the private reply cutoff')
+    }
   }
 
   async _loadDependencies() {
@@ -1526,6 +1766,11 @@ export class WhatsAppBridge extends EventEmitter {
         return inserted
       })
       if (!isNew) continue
+      if (!this.accessPolicy.valid || !this.accessPolicy.autoReplyEnabled) continue
+      const replyCutoff = isGroup
+        ? this.accessPolicy.groupRepliesAfter
+        : this.accessPolicy.privateRepliesAfter
+      if (replyCutoff !== null && normalized.timestamp <= replyCutoff) continue
       const { autoReplySent, ...eventMessage } = this._messageView(normalized, { groupAllowed })
       this.emit('message', {
         ...eventMessage,

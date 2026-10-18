@@ -19,6 +19,14 @@ const silentLogger = {
   child() { return this }
 }
 
+const defaultPermissionSummary = {
+  mode: 'rules_only',
+  valid: true,
+  defaultLevel: 'L5',
+  ownerLevel: 'L1',
+  groupRepliesAfter: null
+}
+
 async function waitFor(predicate, timeoutMs = 1000) {
   const deadline = Date.now() + timeoutMs
   while (!predicate()) {
@@ -105,7 +113,8 @@ test('stores and emits only live incoming text or media without logging QR data'
     status: 'connected',
     account: { id: '85255551234@s.whatsapp.net', name: 'Dot' },
     paired: true,
-    owner: { valid: false, count: 0, directMessagesOnly: true, allowOwnerGroups: false }
+    owner: { valid: false, count: 0, directMessagesOnly: true, allowOwnerGroups: false },
+    permissions: defaultPermissionSummary
   })
   const nowSeconds = Math.floor(Date.now() / 1000)
   socket.ev.emit('messaging-history.set', {
@@ -155,6 +164,17 @@ test('stores and emits only live incoming text or media without logging QR data'
     direction: 'incoming',
     fromMe: false,
     senderRole: 'untrusted',
+    permission: {
+      mode: 'rules_only',
+      policyValid: true,
+      actorLevel: 'L5',
+      roomLevel: 'L5',
+      effectiveLevel: 'L5',
+      audience: 'private',
+      actorIsOwner: false,
+      privateDataAllowed: false,
+      managePermissionsAllowed: false
+    },
     groupAllowed: false,
     mentionsBot: false,
     mentionsAll: false,
@@ -229,6 +249,8 @@ test('sends decoded image content and persists only caption and media metadata',
   const harness = createHarness(dataDir)
   await harness.bridge.start()
   harness.sockets[0].ev.emit('connection.update', { connection: 'open' })
+  const received = []
+  harness.bridge.on('message', (message) => received.push(message))
   const imageBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlVQAAAAASUVORK5CYII='
 
   const messageId = await harness.bridge.sendImage({
@@ -843,7 +865,8 @@ test('reconnects with bounded delay, but never reconnects after logged out', asy
     status: 'logged_out',
     account: null,
     paired: false,
-    owner: { valid: false, count: 0, directMessagesOnly: true, allowOwnerGroups: false }
+    owner: { valid: false, count: 0, directMessagesOnly: true, allowOwnerGroups: false },
+    permissions: defaultPermissionSummary
   })
   await harness.bridge.stop()
 })
@@ -873,7 +896,8 @@ test('keeps paired true for persisted me.id and after connected credential updat
     status: 'connected',
     account: { id: '85255551234@s.whatsapp.net', name: 'Dot' },
     paired: true,
-    owner: { valid: false, count: 0, directMessagesOnly: true, allowOwnerGroups: false }
+    owner: { valid: false, count: 0, directMessagesOnly: true, allowOwnerGroups: false },
+    permissions: defaultPermissionSummary
   })
   await harness.bridge.stop()
 })
@@ -1866,5 +1890,803 @@ test('enforces mention-only group writes, mention-all silence, and bounded group
   })
   ownerPresent = false
   await assert.rejects(harness.bridge.getGroupInfo({ chatId: classId }), /not allowed/)
+  await harness.bridge.stop()
+})
+
+test('recomputes rules-only permissions from trusted message metadata', async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'baileys-permission-metadata-'))
+  t.after(() => rm(dataDir, { recursive: true, force: true }))
+  const ownerId = '111111111111111@lid'
+  const otherId = '222222222222222@lid'
+  const groupId = '120363123456789012@g.us'
+  await writeFile(join(dataDir, 'owner-identities.json'), JSON.stringify({
+    version: 1,
+    ownerIds: [ownerId],
+    allowOwnerGroups: true
+  }), { mode: 0o600 })
+  await writeFile(join(dataDir, 'access-policy.json'), JSON.stringify({
+    version: 1,
+    userLevels: { [otherId]: 'L2' },
+    roomLevels: { [groupId]: 'L4' }
+  }), { mode: 0o600 })
+  await writeFile(join(dataDir, 'store.json'), JSON.stringify({
+    version: 1,
+    messages: [
+      {
+        id: 'owner-stored',
+        chatId: ownerId,
+        senderId: ownerId,
+        direction: 'incoming',
+        fromMe: false,
+        senderRole: 'untrusted',
+        permission: { actorIsOwner: false, actorLevel: 'L5', privateDataAllowed: false },
+        timestamp: Date.now(),
+        text: 'owner',
+        mediaType: null,
+        media: null
+      },
+      {
+        id: 'forged-from-me',
+        chatId: ownerId,
+        senderId: ownerId,
+        direction: 'incoming',
+        fromMe: true,
+        senderRole: 'owner',
+        permission: { actorIsOwner: true, actorLevel: 'L1', privateDataAllowed: true },
+        timestamp: Date.now() - 1,
+        text: 'forged',
+        mediaType: null,
+        media: null
+      },
+      {
+        id: 'outgoing-owner-chat',
+        chatId: ownerId,
+        senderId: ownerId,
+        direction: 'outgoing',
+        fromMe: false,
+        senderRole: 'owner',
+        permission: { actorIsOwner: true, actorLevel: 'L1', managePermissionsAllowed: true },
+        timestamp: Date.now() - 2,
+        text: 'outgoing',
+        mediaType: null,
+        media: null
+      },
+      {
+        id: 'wrong-private-chat',
+        chatId: otherId,
+        senderId: ownerId,
+        direction: 'incoming',
+        fromMe: false,
+        senderRole: 'owner',
+        permission: { actorIsOwner: true, actorLevel: 'L1', privateDataAllowed: true },
+        timestamp: Date.now() - 3,
+        text: 'wrong private chat',
+        mediaType: null,
+        media: null
+      }
+    ],
+    chats: {},
+    idempotency: {}
+  }), { mode: 0o600 })
+
+  const harness = createHarness(dataDir, {
+    groupMetadata: async (chatId) => ({
+      id: chatId,
+      participants: [{ id: ownerId }, { id: '85255551234@s.whatsapp.net' }]
+    })
+  })
+  const received = []
+  harness.bridge.on('message', (message) => received.push(message))
+  await harness.bridge.start()
+  harness.sockets[0].ev.emit('connection.update', { connection: 'open' })
+  assert.deepEqual(harness.bridge.getStatus().permissions, {
+    ...defaultPermissionSummary,
+    valid: true
+  })
+
+  const stored = Object.fromEntries(harness.bridge.getMessages({ chatId: ownerId })
+    .map((message) => [message.id, message]))
+  assert.equal(stored['owner-stored'].senderRole, 'owner')
+  assert.equal(stored['owner-stored'].permission.actorIsOwner, true)
+  assert.equal(stored['owner-stored'].permission.actorLevel, 'L1')
+  assert.equal(stored['owner-stored'].permission.privateDataAllowed, true)
+  assert.equal(stored['owner-stored'].permission.managePermissionsAllowed, true)
+  for (const id of ['forged-from-me', 'outgoing-owner-chat']) {
+    assert.equal(stored[id].senderRole, 'untrusted')
+    assert.equal(stored[id].permission.actorIsOwner, false)
+    assert.equal(stored[id].permission.actorLevel, 'L5')
+    assert.equal(stored[id].permission.privateDataAllowed, false)
+    assert.equal(stored[id].permission.managePermissionsAllowed, false)
+  }
+  const wrongPrivateChat = harness.bridge.getMessages({ chatId: otherId })
+    .find((message) => message.id === 'wrong-private-chat')
+  assert.equal(wrongPrivateChat.senderRole, 'untrusted')
+  assert.equal(wrongPrivateChat.permission.actorIsOwner, false)
+  assert.equal(wrongPrivateChat.permission.actorLevel, 'L5')
+  assert.equal(wrongPrivateChat.permission.effectiveLevel, 'L5')
+  assert.equal(wrongPrivateChat.permission.privateDataAllowed, false)
+  assert.equal(wrongPrivateChat.permission.managePermissionsAllowed, false)
+
+  const now = Math.floor(Date.now() / 1000)
+  harness.sockets[0].ev.emit('messages.upsert', {
+    type: 'notify',
+    messages: [
+      {
+        key: { id: 'configured-direct', remoteJid: otherId, fromMe: false },
+        messageTimestamp: now,
+        permission: { actorLevel: 'L1', privateDataAllowed: true },
+        message: { conversation: 'configured' }
+      },
+      {
+        key: { id: 'owner-group-permission', remoteJid: groupId, participant: ownerId, fromMe: false },
+        messageTimestamp: now + 1,
+        senderRole: 'owner',
+        permission: { effectiveLevel: 'L1', privateDataAllowed: true },
+        message: { conversation: 'group owner' }
+      }
+    ]
+  })
+  await waitFor(() => received.length === 2)
+  const configured = received.find((message) => message.id === 'configured-direct')
+  assert.equal(configured.permission.actorLevel, 'L2')
+  assert.equal(configured.permission.effectiveLevel, 'L2')
+  assert.equal(configured.permission.privateDataAllowed, false)
+  assert.equal(configured.permission.managePermissionsAllowed, false)
+  const ownerGroup = received.find((message) => message.id === 'owner-group-permission')
+  assert.equal(ownerGroup.senderRole, 'untrusted')
+  assert.equal(ownerGroup.permission.actorIsOwner, true)
+  assert.equal(ownerGroup.permission.actorLevel, 'L1')
+  assert.equal(ownerGroup.permission.roomLevel, 'L4')
+  assert.equal(ownerGroup.permission.effectiveLevel, 'L4')
+  assert.equal(ownerGroup.permission.privateDataAllowed, false)
+  assert.equal(ownerGroup.permission.managePermissionsAllowed, false)
+  await harness.bridge.stop()
+})
+
+test('fails closed for invalid access policy while preserving verified owner identity', async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'baileys-permission-invalid-'))
+  t.after(() => rm(dataDir, { recursive: true, force: true }))
+  const ownerId = '111111111111111@lid'
+  const otherId = '222222222222222@lid'
+  const groupId = '120363123456789012@g.us'
+  await writeFile(join(dataDir, 'owner-identities.json'), JSON.stringify({
+    version: 1,
+    ownerIds: [ownerId],
+    allowOwnerGroups: true
+  }), { mode: 0o600 })
+  await writeFile(join(dataDir, 'access-policy.json'), JSON.stringify({
+    version: 1,
+    userLevels: { [otherId]: 'L1' }
+  }), { mode: 0o600 })
+  await writeFile(join(dataDir, 'store.json'), JSON.stringify({
+    version: 1,
+    messages: [
+      {
+        id: 'invalid-owner', chatId: ownerId, senderId: ownerId, direction: 'incoming', fromMe: false,
+        timestamp: Date.now(), text: 'owner', mediaType: null, media: null
+      },
+      {
+        id: 'invalid-group', chatId: groupId, senderId: otherId, direction: 'incoming', fromMe: false,
+        timestamp: Date.now(), text: 'group', mediaType: null, media: null,
+        _mentionedJids: ['85255551234@s.whatsapp.net']
+      }
+    ],
+    chats: {},
+    idempotency: {}
+  }), { mode: 0o600 })
+  const harness = createHarness(dataDir)
+  const received = []
+  harness.bridge.on('message', (message) => received.push(message))
+  await harness.bridge.start()
+  harness.sockets[0].ev.emit('connection.update', { connection: 'open' })
+  assert.equal(harness.bridge.getStatus().permissions.valid, false)
+  const owner = harness.bridge.getMessages({ chatId: ownerId })[0]
+  assert.equal(owner.permission.actorIsOwner, true)
+  assert.equal(owner.permission.actorLevel, 'L1')
+  assert.equal(owner.permission.effectiveLevel, 'L5')
+  assert.equal(owner.permission.privateDataAllowed, false)
+  assert.equal(owner.permission.managePermissionsAllowed, false)
+  assert.deepEqual(await harness.bridge.getPendingReplies({ scope: 'groups', after: 1 }), [])
+  await assert.rejects(harness.bridge.sendText({
+    chatId: groupId,
+    text: 'blocked',
+    idempotencyKey: 'dot-auto:invalid-group'
+  }), /access policy is invalid/)
+  await assert.rejects(harness.bridge.sendText({
+    chatId: ownerId,
+    text: 'blocked private',
+    idempotencyKey: 'dot-auto:invalid-owner'
+  }), /access policy is invalid/)
+  harness.sockets[0].ev.emit('messages.upsert', {
+    type: 'notify',
+    messages: [{
+      key: { id: 'invalid-live-owner', remoteJid: ownerId, fromMe: false },
+      messageTimestamp: Date.now(),
+      message: { conversation: 'must not emit' }
+    }]
+  })
+  await waitFor(() => harness.bridge.getMessages({ chatId: ownerId })
+    .some((message) => message.id === 'invalid-live-owner'))
+  assert.deepEqual(received, [])
+  assert.equal(harness.sendCalls, 0)
+  await harness.bridge.stop()
+})
+
+test('enforces group reply cutoff for pending and sends without affecting private replies', async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'baileys-group-cutoff-'))
+  t.after(() => rm(dataDir, { recursive: true, force: true }))
+  const ownerId = '111111111111111@lid'
+  const senderId = '222222222222222@lid'
+  const botId = '333333333333333@lid'
+  const botPn = '85255551234@s.whatsapp.net'
+  const groupId = '120363123456789012@g.us'
+  const now = Date.now()
+  const cutoff = now - 1000
+  await writeFile(join(dataDir, 'owner-identities.json'), JSON.stringify({
+    version: 1,
+    ownerIds: [ownerId],
+    allowOwnerGroups: true
+  }), { mode: 0o600 })
+  await writeFile(join(dataDir, 'access-policy.json'), JSON.stringify({
+    version: 1,
+    groupRepliesAfter: cutoff
+  }), { mode: 0o600 })
+  const oldSentText = 'already sent'
+  await writeFile(join(dataDir, 'store.json'), JSON.stringify({
+    version: 1,
+    messages: [
+      {
+        id: 'old-group', chatId: groupId, senderId, direction: 'incoming', fromMe: false,
+        timestamp: cutoff - 1, text: 'old', mediaType: null, media: null, _mentionedJids: [botId]
+      },
+      {
+        id: 'old-group-sent', chatId: groupId, senderId, direction: 'incoming', fromMe: false,
+        timestamp: cutoff, text: 'old sent', mediaType: null, media: null, _mentionedJids: [botId]
+      },
+      {
+        id: 'new-group', chatId: groupId, senderId, direction: 'incoming', fromMe: false,
+        timestamp: cutoff + 1, text: 'new', mediaType: null, media: null, _mentionedJids: [botId]
+      },
+      {
+        id: 'old-private', chatId: ownerId, senderId: ownerId, direction: 'incoming', fromMe: false,
+        timestamp: cutoff - 10, text: 'private', mediaType: null, media: null
+      }
+    ],
+    chats: {},
+    idempotency: {
+      'dot-auto:old-group-sent': {
+        key: 'dot-auto:old-group-sent',
+        chatId: groupId,
+        requestType: 'text',
+        textHash: createHash('sha256').update(oldSentText).digest('hex'),
+        messageId: 'SENT-OLD',
+        status: 'sent',
+        createdAt: now
+      }
+    }
+  }), { mode: 0o600 })
+  const harness = createHarness(dataDir, {
+    socketUser: { id: botPn, lid: botId, name: 'Dot' },
+    groupMetadata: async (chatId) => ({
+      id: chatId,
+      participants: [{ id: ownerId }, { id: botPn, lid: botId }]
+    })
+  })
+  await harness.bridge.start()
+  harness.sockets[0].ev.emit('connection.update', { connection: 'open' })
+  assert.equal(harness.bridge.getStatus().permissions.groupRepliesAfter, cutoff)
+  assert.deepEqual((await harness.bridge.getPendingReplies({
+    scope: 'groups',
+    after: cutoff - 1000
+  })).map((message) => message.id), ['new-group'])
+  await assert.rejects(harness.bridge.sendText({
+    chatId: groupId,
+    text: 'blocked old',
+    idempotencyKey: 'dot-auto:old-group'
+  }), /predates the group reply cutoff/)
+  await assert.rejects(harness.bridge.sendText({
+    chatId: groupId,
+    text: `${oldSentText} changed`,
+    idempotencyKey: 'dot-auto:old-group-sent'
+  }), /different request/)
+  assert.equal(await harness.bridge.sendText({
+    chatId: groupId,
+    text: oldSentText,
+    idempotencyKey: 'dot-auto:old-group-sent'
+  }), 'SENT-OLD')
+  assert.equal(harness.sendCalls, 0)
+  await harness.bridge.sendText({
+    chatId: groupId,
+    text: 'new reply',
+    idempotencyKey: 'dot-auto:new-group'
+  })
+  await harness.bridge.sendText({
+    chatId: ownerId,
+    text: 'private reply',
+    idempotencyKey: 'dot-auto:old-private'
+  })
+  assert.equal(harness.sendCalls, 2)
+  await harness.bridge.stop()
+})
+
+test('manages console users and groups with owner protection, revisions, and durable readback', async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'baileys-console-domain-'))
+  t.after(() => rm(dataDir, { recursive: true, force: true }))
+  const ownerId = '111111111111111@lid'
+  const userId = '85255550000@s.whatsapp.net'
+  const groupId = '120363123456789012@g.us'
+  await writeFile(join(dataDir, 'owner-identities.json'), JSON.stringify({
+    version: 1,
+    ownerIds: [ownerId],
+    allowOwnerGroups: true,
+    mentionOnlyGroupIds: [groupId]
+  }), { mode: 0o600 })
+  await writeFile(join(dataDir, 'store.json'), JSON.stringify({
+    version: 1,
+    messages: [],
+    chats: {
+      [groupId]: { id: groupId, name: 'Project group', updatedAt: Date.now(), lastMessage: null }
+    },
+    idempotency: {}
+  }), { mode: 0o600 })
+
+  const first = createHarness(dataDir)
+  await first.bridge.start()
+  first.sockets[0].ev.emit('connection.update', { connection: 'open' })
+  const initial = first.bridge.getConsoleState()
+  assert.deepEqual(initial.channels, {
+    whatsapp: {
+      status: 'connected',
+      paired: true,
+      account: { id: '85255551234@s.whatsapp.net', name: 'Dot' },
+      autoReplyEnabled: true,
+      ownerGroupsAllowed: true,
+      mentionOnlyGroupIds: [groupId]
+    },
+    instagram: { status: 'not_configured', available: false }
+  })
+  assert.deepEqual(initial.permissions, { valid: true, defaultLevel: 'L5', mode: 'rules_only' })
+  assert.deepEqual(initial.users, [{
+    id: ownerId,
+    displayName: ownerId,
+    whatsappId: ownerId,
+    instagramUsername: null,
+    isOwner: true,
+    level: 'L1',
+    identityState: 'owner_configured'
+  }])
+  assert.deepEqual(initial.groups, [{ id: groupId, name: 'Project group', level: 'L5', mentionOnly: true }])
+  assert.match(initial.revision, /^[a-f0-9]{64}$/)
+
+  await assert.rejects(first.bridge.updateConsoleSettings({
+    revision: initial.revision,
+    action: 'save-user',
+    user: { displayName: 'Owner alias', whatsappId: ownerId, level: 'L2' }
+  }), (error) => error.status === 403)
+  await assert.rejects(first.bridge.updateConsoleSettings({
+    revision: initial.revision,
+    action: 'delete-user',
+    userId: ownerId
+  }), (error) => error.status === 403)
+  await assert.rejects(first.bridge.updateConsoleSettings({
+    revision: initial.revision,
+    action: 'save-user',
+    user: { displayName: 'Fake owner', whatsappId: '+85255550000', level: 'L1' }
+  }), (error) => error.status === 400)
+
+  const withUser = await first.bridge.updateConsoleSettings({
+    revision: initial.revision,
+    action: 'save-user',
+    user: {
+      displayName: 'Alice',
+      whatsappId: '+85255550000',
+      instagramUsername: 'alice.pending',
+      level: 'L2'
+    }
+  })
+  assert.deepEqual(withUser.users.find((item) => item.id === userId), {
+    id: userId,
+    displayName: 'Alice',
+    whatsappId: userId,
+    instagramUsername: 'alice.pending',
+    isOwner: false,
+    level: 'L2',
+    identityState: 'configured'
+  })
+  await assert.rejects(first.bridge.updateConsoleSettings({
+    revision: withUser.revision,
+    action: 'save-user',
+    user: {
+      id: userId,
+      displayName: 'Alice',
+      whatsappId: '85255550001',
+      level: 'L3'
+    }
+  }), (error) => error.status === 409)
+
+  const sharedRevision = withUser.revision
+  const [groupUpdate, conflictingUpdate] = await Promise.allSettled([
+    first.bridge.updateConsoleSettings({
+      revision: sharedRevision,
+      action: 'save-group',
+      chatId: groupId,
+      level: 'L3'
+    }),
+    first.bridge.updateConsoleSettings({
+      revision: sharedRevision,
+      action: 'set-replies',
+      enabled: false
+    })
+  ])
+  assert.equal(groupUpdate.status, 'fulfilled')
+  assert.equal(conflictingUpdate.status, 'rejected')
+  assert.equal(conflictingUpdate.reason.status, 409)
+  assert.equal(groupUpdate.value.groups[0].level, 'L3')
+  assert.equal(groupUpdate.value.groups[0].mentionOnly, true)
+  assert.equal(groupUpdate.value.channels.whatsapp.autoReplyEnabled, true)
+  assert.equal((await stat(join(dataDir, 'access-policy.json'))).mode & 0o777, 0o600)
+  const policyDocument = JSON.parse(await readFile(join(dataDir, 'access-policy.json'), 'utf8'))
+  assert.equal(policyDocument.userLevels[userId], 'L2')
+  assert.equal(policyDocument.userProfiles[userId].displayName, 'Alice')
+  assert.equal(policyDocument.roomLevels[groupId], 'L3')
+  assert.equal(Object.hasOwn(policyDocument, 'mentionOnlyGroupIds'), false)
+  await first.bridge.stop()
+
+  const second = createHarness(dataDir)
+  const received = []
+  second.bridge.on('message', (message) => received.push(message))
+  await second.bridge.start()
+  second.sockets[0].ev.emit('connection.update', { connection: 'open' })
+  const restored = second.bridge.getConsoleState()
+  assert.equal(restored.users.find((item) => item.id === userId).displayName, 'Alice')
+  assert.equal(restored.users.find((item) => item.id === userId).level, 'L2')
+  assert.equal(restored.groups.find((item) => item.id === groupId).level, 'L3')
+  second.sockets[0].ev.emit('messages.upsert', {
+    type: 'notify',
+    messages: [{
+      key: { id: 'profile-not-authority', remoteJid: userId, fromMe: false },
+      pushName: 'Owner',
+      messageTimestamp: Date.now(),
+      message: { conversation: 'profile text is not authority' }
+    }]
+  })
+  await waitFor(() => received.length === 1)
+  assert.equal(received[0].permission.actorLevel, 'L2')
+  assert.equal(received[0].permission.actorIsOwner, false)
+  assert.equal(received[0].permission.privateDataAllowed, false)
+  assert.equal(received[0].permission.managePermissionsAllowed, false)
+  const updated = await second.bridge.updateConsoleSettings({
+    revision: restored.revision,
+    action: 'save-user',
+    user: {
+      id: userId,
+      displayName: 'Alice Updated',
+      whatsappId: '+85255550000',
+      instagramUsername: null,
+      level: 'L4'
+    }
+  })
+  assert.deepEqual(updated.users.find((item) => item.id === userId), {
+    id: userId,
+    displayName: 'Alice Updated',
+    whatsappId: userId,
+    instagramUsername: null,
+    isOwner: false,
+    level: 'L4',
+    identityState: 'configured'
+  })
+  const deleted = await second.bridge.updateConsoleSettings({
+    revision: updated.revision,
+    action: 'delete-user',
+    userId
+  })
+  assert.equal(deleted.users.some((item) => item.id === userId), false)
+  assert.equal(deleted.users.some((item) => item.id === ownerId), true)
+  await second.bridge.stop()
+})
+
+test('rejects console mutation when the policy is invalid or no owner can be synthesized', async (t) => {
+  const invalidDir = await mkdtemp(join(tmpdir(), 'baileys-console-invalid-'))
+  t.after(() => rm(invalidDir, { recursive: true, force: true }))
+  await writeFile(join(invalidDir, 'access-policy.json'), JSON.stringify({
+    version: 1,
+    unknown: true
+  }), { mode: 0o600 })
+  const invalid = createHarness(invalidDir)
+  await invalid.bridge.start()
+  assert.equal(invalid.bridge.getConsoleState().permissions.valid, false)
+  await assert.rejects(invalid.bridge.updateConsoleSettings({
+    revision: invalid.bridge.getConsoleState().revision,
+    action: 'set-replies',
+    enabled: false
+  }), (error) => error.status === 409)
+  await invalid.bridge.stop()
+
+  const noOwnerDir = await mkdtemp(join(tmpdir(), 'baileys-console-no-owner-'))
+  t.after(() => rm(noOwnerDir, { recursive: true, force: true }))
+  const noOwner = createHarness(noOwnerDir)
+  await noOwner.bridge.start()
+  const state = noOwner.bridge.getConsoleState()
+  assert.deepEqual(state.users, [])
+  await assert.rejects(noOwner.bridge.updateConsoleSettings({
+    revision: state.revision,
+    action: 'save-user',
+    user: { displayName: 'Cannot become owner', whatsappId: '85255550000', level: 'L1' }
+  }), (error) => error.status === 400)
+  assert.deepEqual(noOwner.bridge.getConsoleState().users, [])
+  await noOwner.bridge.stop()
+})
+
+test('pauses automatic events and sends, then resumes without replaying old messages', async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'baileys-console-replies-'))
+  t.after(() => rm(dataDir, { recursive: true, force: true }))
+  const ownerId = '111111111111111@lid'
+  const senderId = '222222222222222@lid'
+  const botId = '333333333333333@lid'
+  const botPn = '85255551234@s.whatsapp.net'
+  const groupId = '120363123456789012@g.us'
+  await writeFile(join(dataDir, 'owner-identities.json'), JSON.stringify({
+    version: 1,
+    ownerIds: [ownerId],
+    allowOwnerGroups: true
+  }), { mode: 0o600 })
+  const harness = createHarness(dataDir, {
+    socketUser: { id: botPn, lid: botId, name: 'Dot' },
+    groupMetadata: async (chatId) => ({
+      id: chatId,
+      participants: [{ id: ownerId }, { id: botPn, lid: botId }]
+    })
+  })
+  const received = []
+  harness.bridge.on('message', (message) => received.push(message))
+  await harness.bridge.start()
+  harness.sockets[0].ev.emit('connection.update', { connection: 'open' })
+  const incoming = (id, chatId, timestamp) => ({
+    key: {
+      id,
+      remoteJid: chatId,
+      fromMe: false,
+      ...(chatId === groupId ? { participant: senderId } : {})
+    },
+    messageTimestamp: timestamp,
+    message: chatId === groupId
+      ? { extendedTextMessage: { text: id, contextInfo: { mentionedJid: [botId] } } }
+      : { conversation: id }
+  })
+  const initialTimestamp = Date.now()
+  harness.sockets[0].ev.emit('messages.upsert', {
+    type: 'notify',
+    messages: [
+      incoming('initial-private', ownerId, initialTimestamp),
+      incoming('initial-group', groupId, initialTimestamp + 1)
+    ]
+  })
+  await waitFor(() => received.length === 2)
+
+  const paused = await harness.bridge.updateConsoleSettings({
+    revision: harness.bridge.getConsoleState().revision,
+    action: 'set-replies',
+    enabled: false
+  })
+  assert.equal(paused.channels.whatsapp.autoReplyEnabled, false)
+  const pausedTimestamp = Date.now()
+  harness.sockets[0].ev.emit('messages.upsert', {
+    type: 'notify',
+    messages: [
+      incoming('paused-private', ownerId, pausedTimestamp),
+      incoming('paused-group', groupId, pausedTimestamp + 1)
+    ]
+  })
+  await waitFor(() => harness.bridge.getMessages({ chatId: ownerId }).some((message) => message.id === 'paused-private'))
+  await waitFor(() => harness.bridge.getMessages({ chatId: groupId }).some((message) => message.id === 'paused-group'))
+  assert.equal(received.length, 2)
+  assert.deepEqual(await harness.bridge.getPendingReplies({ scope: 'groups', after: 1 }), [])
+
+  const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlVQAAAAASUVORK5CYII='
+  const video = Buffer.from([0x00, 0x00, 0x00, 0x10, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d])
+  await assert.rejects(harness.bridge.sendText({
+    chatId: ownerId, text: 'paused', idempotencyKey: 'dot-auto:paused-private'
+  }), /paused/)
+  await assert.rejects(harness.bridge.sendImage({
+    chatId: ownerId, imageBase64: png, idempotencyKey: 'dot-auto:paused-private'
+  }), /paused/)
+  await assert.rejects(harness.bridge.sendMedia({
+    chatId: ownerId,
+    kind: 'video',
+    data: video,
+    mimetype: 'video/mp4',
+    idempotencyKey: 'dot-auto:paused-private'
+  }), /paused/)
+  await assert.rejects(harness.bridge.sendMedia({
+    chatId: ownerId,
+    kind: 'document',
+    data: Buffer.from('document'),
+    mimetype: 'text/plain',
+    fileName: 'document.txt',
+    idempotencyKey: 'dot-auto:paused-private'
+  }), /paused/)
+  await assert.rejects(harness.bridge.sendText({
+    chatId: groupId, text: 'paused', idempotencyKey: 'dot-auto:paused-group'
+  }), /paused/)
+  assert.equal(harness.sendCalls, 0)
+  await harness.bridge.sendText({ chatId: ownerId, text: 'manual', idempotencyKey: 'manual:paused' })
+  assert.equal(harness.sendCalls, 1)
+
+  const resumed = await harness.bridge.updateConsoleSettings({
+    revision: paused.revision,
+    action: 'set-replies',
+    enabled: true
+  })
+  assert.equal(resumed.channels.whatsapp.autoReplyEnabled, true)
+  const cutoff = harness.bridge.getStatus().permissions.groupRepliesAfter
+  assert.ok(Number.isSafeInteger(cutoff) && cutoff >= pausedTimestamp)
+  await assert.rejects(harness.bridge.sendText({
+    chatId: ownerId, text: 'old private', idempotencyKey: 'dot-auto:paused-private'
+  }), /private reply cutoff/)
+  await assert.rejects(harness.bridge.sendText({
+    chatId: groupId, text: 'old group', idempotencyKey: 'dot-auto:paused-group'
+  }), /group reply cutoff/)
+
+  harness.sockets[0].ev.emit('messages.upsert', {
+    type: 'notify',
+    messages: [
+      incoming('late-old-private', ownerId, cutoff - 1),
+      incoming('late-old-group', groupId, cutoff - 1)
+    ]
+  })
+  await waitFor(() => harness.bridge.getMessages({ chatId: ownerId }).some((message) => message.id === 'late-old-private'))
+  await waitFor(() => harness.bridge.getMessages({ chatId: groupId }).some((message) => message.id === 'late-old-group'))
+  assert.equal(received.length, 2)
+
+  harness.sockets[0].ev.emit('messages.upsert', {
+    type: 'notify',
+    messages: [
+      incoming('new-private', ownerId, cutoff + 1),
+      incoming('new-group', groupId, cutoff + 2)
+    ]
+  })
+  await waitFor(() => received.length === 4)
+  assert.deepEqual((await harness.bridge.getPendingReplies({ scope: 'groups', after: 1 }))
+    .map((message) => message.id), ['new-group'])
+  const privateReceipt = await harness.bridge.sendText({
+    chatId: ownerId, text: 'new private', idempotencyKey: 'dot-auto:new-private'
+  })
+  await harness.bridge.sendText({
+    chatId: groupId, text: 'new group', idempotencyKey: 'dot-auto:new-group'
+  })
+  assert.equal(harness.sendCalls, 3)
+
+  await harness.bridge.updateConsoleSettings({
+    revision: resumed.revision,
+    action: 'set-replies',
+    enabled: false
+  })
+  assert.equal(await harness.bridge.sendText({
+    chatId: ownerId, text: 'new private', idempotencyKey: 'dot-auto:new-private'
+  }), privateReceipt)
+  assert.equal(harness.sendCalls, 3)
+  await harness.bridge.stop()
+})
+
+test('rechecks pause synchronously after an in-flight store persist for every send path', async (t) => {
+  const ownerId = '111111111111111@lid'
+  const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlVQAAAAASUVORK5CYII='
+  const video = Buffer.from([0x00, 0x00, 0x00, 0x10, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d])
+  const cases = [
+    ['text', (bridge, sourceId) => bridge.sendText({
+      chatId: ownerId, text: 'reply', idempotencyKey: `dot-auto:${sourceId}`
+    })],
+    ['image', (bridge, sourceId) => bridge.sendImage({
+      chatId: ownerId, imageBase64: png, idempotencyKey: `dot-auto:${sourceId}`
+    })],
+    ['media', (bridge, sourceId) => bridge.sendMedia({
+      chatId: ownerId,
+      kind: 'video',
+      data: video,
+      mimetype: 'video/mp4',
+      idempotencyKey: `dot-auto:${sourceId}`
+    })]
+  ]
+
+  for (const [name, send] of cases) {
+    const dataDir = await mkdtemp(join(tmpdir(), `baileys-console-race-${name}-`))
+    t.after(() => rm(dataDir, { recursive: true, force: true }))
+    await writeFile(join(dataDir, 'owner-identities.json'), JSON.stringify({
+      version: 1,
+      ownerIds: [ownerId]
+    }), { mode: 0o600 })
+    const harness = createHarness(dataDir)
+    await harness.bridge.start()
+    harness.sockets[0].ev.emit('connection.update', { connection: 'open' })
+    const sourceId = `race-${name}`
+    harness.sockets[0].ev.emit('messages.upsert', {
+      type: 'notify',
+      messages: [{
+        key: { id: sourceId, remoteJid: ownerId, fromMe: false },
+        messageTimestamp: Date.now(),
+        message: { conversation: `source ${name}` }
+      }]
+    })
+    await waitFor(() => harness.bridge.getMessages({ chatId: ownerId })
+      .some((message) => message.id === sourceId))
+
+    let enterPersist
+    let releasePersist
+    const persistEntered = new Promise((resolve) => { enterPersist = resolve })
+    const persistReleased = new Promise((resolve) => { releasePersist = resolve })
+    const originalPersist = harness.bridge.store.persist.bind(harness.bridge.store)
+    harness.bridge.store.persist = async () => {
+      enterPersist()
+      await persistReleased
+      return originalPersist()
+    }
+    const rejectedSend = assert.rejects(send(harness.bridge, sourceId), /paused/)
+    await persistEntered
+    await harness.bridge.updateConsoleSettings({
+      revision: harness.bridge.getConsoleState().revision,
+      action: 'set-replies',
+      enabled: false
+    })
+    releasePersist()
+    await rejectedSend
+    assert.equal(harness.sendCalls, 0)
+    await harness.bridge.stop()
+  }
+})
+
+test('rechecks pause after asynchronous group metadata before returning pending replies', async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'baileys-console-pending-race-'))
+  t.after(() => rm(dataDir, { recursive: true, force: true }))
+  const ownerId = '111111111111111@lid'
+  const senderId = '222222222222222@lid'
+  const botId = '333333333333333@lid'
+  const botPn = '85255551234@s.whatsapp.net'
+  const groupId = '120363123456789012@g.us'
+  const now = Date.now()
+  await writeFile(join(dataDir, 'owner-identities.json'), JSON.stringify({
+    version: 1,
+    ownerIds: [ownerId],
+    allowOwnerGroups: true
+  }), { mode: 0o600 })
+  await writeFile(join(dataDir, 'store.json'), JSON.stringify({
+    version: 1,
+    messages: [{
+      id: 'pending-race',
+      chatId: groupId,
+      senderId,
+      direction: 'incoming',
+      fromMe: false,
+      timestamp: now,
+      text: 'pending race',
+      mediaType: null,
+      media: null,
+      _mentionedJids: [botId]
+    }],
+    chats: {},
+    idempotency: {}
+  }), { mode: 0o600 })
+  let enterMetadata
+  let releaseMetadata
+  const metadataEntered = new Promise((resolve) => { enterMetadata = resolve })
+  const metadataReleased = new Promise((resolve) => { releaseMetadata = resolve })
+  const harness = createHarness(dataDir, {
+    socketUser: { id: botPn, lid: botId, name: 'Dot' },
+    groupMetadata: async (chatId) => {
+      enterMetadata()
+      await metadataReleased
+      return { id: chatId, participants: [{ id: ownerId }, { id: botPn, lid: botId }] }
+    }
+  })
+  await harness.bridge.start()
+  harness.sockets[0].ev.emit('connection.update', { connection: 'open' })
+  const pending = harness.bridge.getPendingReplies({ scope: 'groups', after: now - 1 })
+  await metadataEntered
+  await harness.bridge.updateConsoleSettings({
+    revision: harness.bridge.getConsoleState().revision,
+    action: 'set-replies',
+    enabled: false
+  })
+  releaseMetadata()
+  assert.deepEqual(await pending, [])
   await harness.bridge.stop()
 })

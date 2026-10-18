@@ -1,0 +1,1 @@
+instagrapi==3.0.25

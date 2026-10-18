@@ -13,6 +13,13 @@ owner-identities.json
 **/owner-identities.json
 settings.json
 **/settings.json
+**/meta-state.json
+**/events-instagram-state.json
+**/events-facebook-state.json
+**/instagram-private-state.json
+**/instagram-private-session.json
+**/events-instagram-private-*-state.json
+.venv-instagram/
 *.token
 logs/
 **/logs/

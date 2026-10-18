@@ -3,6 +3,7 @@ import { mkdir, chmod, lstat, readFile, rename, writeFile } from "node:fs/promis
 import { join } from "node:path";
 
 const SCOPES = ["whatsapp.read", "whatsapp.send", "events"];
+const ADDITIONAL_SCOPES = new Set(["instagram.read", "instagram.send", "facebook.read", "facebook.send", "instagram.private.read", "instagram.private.send"]);
 const MAX_CLIENTS = 100;
 const MAX_CODES = 100;
 const MAX_TOKENS = 300;
@@ -38,9 +39,9 @@ function asArray(value) {
   return [value];
 }
 
-function parseScopes(value) {
+function parseScopes(value, supportedScopes = SCOPES) {
   const scopes = [...new Set(String(value || "").split(/\s+/).filter(Boolean))];
-  if (scopes.some((scope) => !SCOPES.includes(scope))) {
+  if (scopes.some((scope) => !supportedScopes.includes(scope))) {
     throw new OAuthError("invalid_scope", "要求的權限範圍不受支援");
   }
   return scopes;
@@ -135,6 +136,11 @@ export async function createAuthManager(config = {}) {
   const adminToken = await readAdminToken(config);
   if (adminToken.length < 16) throw new Error("ADMIN_TOKEN 至少需要 16 個字元");
   const allowLocalRedirects = config.allowLocalRedirects === true || process.env.ALLOW_LOCAL_OAUTH_REDIRECTS === "true";
+  if (config.additionalScopes !== undefined && (!Array.isArray(config.additionalScopes)
+    || config.additionalScopes.some((scope) => typeof scope !== "string" || !ADDITIONAL_SCOPES.has(scope)))) {
+    throw new Error("additionalScopes 包含不受支援的權限");
+  }
+  const scopes = [...SCOPES, ...new Set(config.additionalScopes || [])];
 
   await mkdir(dataDir, { recursive: true, mode: 0o700 });
   await chmod(dataDir, 0o700);
@@ -207,28 +213,28 @@ export async function createAuthManager(config = {}) {
       throw new OAuthError("invalid_request", "必須使用 PKCE S256");
     }
     if (String(params.resource || "") !== resource) throw new OAuthError("invalid_target", "resource 不符");
-    const scopes = parseScopes(params.scope);
-    if (scopes.length === 0) throw new OAuthError("invalid_scope", "至少需要一項權限");
+    const requestedScopes = parseScopes(params.scope, scopes);
+    if (requestedScopes.length === 0) throw new OAuthError("invalid_scope", "至少需要一項權限");
     return {
       clientId,
       redirectUri,
       state: String(params.state || ""),
       codeChallenge: String(params.code_challenge),
       resource,
-      scopes,
+      scopes: requestedScopes,
     };
   }
 
   return {
     issuer,
     resource,
-    scopes: [...SCOPES],
+    scopes: [...scopes],
 
     protectedResourceMetadata() {
       return {
         resource,
         authorization_servers: [issuer],
-        scopes_supported: [...SCOPES],
+        scopes_supported: [...scopes],
       };
     },
 
@@ -242,7 +248,7 @@ export async function createAuthManager(config = {}) {
         grant_types_supported: ["authorization_code", "refresh_token"],
         code_challenge_methods_supported: ["S256"],
         token_endpoint_auth_methods_supported: ["none"],
-        scopes_supported: [...SCOPES],
+        scopes_supported: [...scopes],
         authorization_response_iss_parameter_supported: true,
       };
     },
@@ -365,7 +371,7 @@ export async function createAuthManager(config = {}) {
             throw new OAuthError("invalid_grant", "refresh token 與請求不符");
           }
           if (!state.clients[String(fields.client_id || "")]) throw new OAuthError("invalid_client", "OAuth client 不存在", 401);
-          const requested = fields.scope ? parseScopes(fields.scope) : grant.scopes;
+          const requested = fields.scope ? parseScopes(fields.scope, scopes) : grant.scopes;
           if (requested.some((scope) => !grant.scopes.includes(scope))) throw new OAuthError("invalid_scope", "不可擴大 refresh token 權限");
           delete state.refreshTokens[refreshHash];
           return issueTokens(grant.clientId, requested, grant.resource);

@@ -4,6 +4,12 @@
 
 將 ChatGPT Dot 接入社交與通訊平台的教程及參考實作。
 
+Instagram 專業帳戶私訊、Facebook 粉專 Messenger，以及選用的非官方 `instagrapi` 個人帳戶私訊／群組已有本機參考實作及模擬測試；真實 Meta OAuth、Instagram Session 與訊息收發尚未驗收，亦未上線。請見 [Meta 接入指南](docs/meta-setup.md)、[Instagram 私人接入指南](docs/instagram-private.md)及[多平台接入研究](docs/social-platforms.md)。Threads、微信、QQ、Moltbook 仍屬研究及規劃。
+
+## 運行要求
+
+需準備一台長期開機、連網並持續運行橋接服務的**電腦、VPS 或 NAS**；NAS 須支援本專案的執行環境。自動收訊及回覆期間，主機不可休眠。主機關機、休眠、斷網或橋接服務停止時，自動收訊及回覆會中斷。
+
 ## 目前參考實作：透過 Baileys 接入 WhatsApp
 
 把一個 WhatsApp 帳戶透過 [Baileys](https://github.com/WhiskeySockets/Baileys) 接到受 OAuth 保護的 MCP 伺服器，再由 ChatGPT Dot 透過原生 MCP Events 接收新訊息並回覆。
@@ -18,6 +24,10 @@
 - 有界訊息保存、事件佇列、重試、防重及安全日誌
 
 Baileys 是非官方 WhatsApp Web 介面，與 WhatsApp／Meta 無關；使用可能涉及帳戶風險，請遵守 WhatsApp 條款，勿作垃圾訊息或大量自動發送。
+
+## 選用 Instagram 私人 transport
+
+獨立 `instagrapi` transport 加入個人帳戶私訊及 owner 在場的群組，使用分開的數字 ID、真人 TTY login helper、有界輪詢轉原生 MCP Events，以及綁定來源的文字／圖片回覆。此路徑屬非官方；在設定不可變帳戶 ID 及已保存 Session 前保持停用。請依照[完整設定及安全指南](docs/instagram-private.md)。
 
 ## 運作方式
 
@@ -47,7 +57,8 @@ Cloudflare Tunnel 對外提供 HTTPS；VPS 不需要把 4391 或 4392 開放到�
 - Node.js `24.22.0`
 - `@whiskeysockets/baileys` `7.0.0-rc14`
 - npm 依 `package-lock.json` 執行 `npm ci`
-- Python 3（Ubuntu 24.04 內建版本即可）
+- Python 3.10 或以上及 `venv`
+- 選用私人 Instagram 路徑依 `requirements-instagram.txt` 鎖定 `instagrapi`
 - `cloudflared` 官方套件
 
 OpenAI 的 MCP Events 目前需要 MCP 2.0 protocol `2026-07-28`，並使用 webhook delivery；支援範圍、Dot 供應情況及介面仍可能變動，請以 [OpenAI MCP Events 文件](https://developers.openai.com/plugins/build/mcp-events)為準。
@@ -59,12 +70,13 @@ $HOME/apps/baileys-dot/
 ├── current -> releases/<release-id>
 ├── releases/<release-id>/
 ├── runtime/node -> node-v24.22.0-linux-<arch>
-├── shared/                  # 0700；登入、OAuth、訊息及事件狀態
+├── runtime/instagram-venv/ # 選用私人 Instagram Python 環境
+├── shared/                  # 0700；登入、Session、OAuth、訊息及事件狀態
 ├── supervise.py             # 目前 supervisor
 └── shared/admin.token       # 0600
 ```
 
-`shared` 不屬於 release，更新及回退時不會清除 WhatsApp 登入與 OAuth／訊息／事件狀態。
+`shared` 不屬於 release，更新及回退時不會清除 WhatsApp 登入、選用 Instagram Session 及 OAuth／訊息／事件狀態。
 
 ## 1. 準備網域與 Cloudflare Tunnel
 
@@ -83,7 +95,7 @@ Service:  http://127.0.0.1:4391
 
 ```sh
 sudo apt-get update
-sudo apt-get install -y ca-certificates curl git xz-utils python3 cron
+sudo apt-get install -y ca-certificates curl git xz-utils python3 python3-venv cron
 sudo install -d -m 0755 /usr/share/keyrings
 curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
   | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
@@ -155,10 +167,14 @@ git clone --depth 1 https://github.com/miku2339/dot-social-bridge.git "$RELEASE_
 cd "$RELEASE_DIR"
 npm ci
 npm test
-python3 -m unittest -v test_supervise.py
+[ -x "$APP_ROOT/runtime/instagram-venv/bin/python" ] \
+  || python3 -m venv "$APP_ROOT/runtime/instagram-venv"
+"$APP_ROOT/runtime/instagram-venv/bin/python" -m pip install \
+  -r "$RELEASE_DIR/requirements-instagram.txt"
+python3 -m unittest -v test_supervise.py test_instagram_worker.py
 ```
 
-目前完整本機驗證應為 59 個 Node tests 及 4 個 Python tests 全部通過。測試通過後才切換：
+所有 Node 及 Python tests 通過後才切換：
 
 ```sh
 export APP_ROOT="$HOME/apps/baileys-dot"
@@ -182,6 +198,7 @@ cat >"$APP_ROOT/shared/settings.json" <<EOF
 {
   "PUBLIC_URL": "https://whatsapp.example.com",
   "DATA_DIR": "$APP_ROOT/shared",
+  "INSTAGRAM_PYTHON": "$APP_ROOT/runtime/instagram-venv/bin/python",
   "ADMIN_TOKEN_FILE": "$APP_ROOT/shared/admin.token",
   "PORT": "4391",
   "LOG_LEVEL": "info"
@@ -190,7 +207,7 @@ EOF
 chmod 0600 "$APP_ROOT/shared/settings.json"
 ```
 
-把 `whatsapp.example.com` 換成第 1 步設定的網域。正式環境不要設定 `ALLOW_LOCAL_OAUTH_REDIRECTS`。
+把 `whatsapp.example.com` 換成第 1 步設定的網域。正式環境不要設定 `ALLOW_LOCAL_OAUTH_REDIRECTS`。`INSTAGRAM_PYTHON` 指向鎖定套件的 worker；私人 Instagram 帳戶 ID 及 Session 須另按[真人登入及控制台流程](docs/instagram-private.md)設定。
 
 在自己的電腦開另一個 terminal，以隱藏輸入建立管理員密碼，再經 SSH stdin 傳到 VPS。以下不會把密碼顯示在畫面或寫進遠端 command line：
 
@@ -324,6 +341,12 @@ nohup python3 "$APP_ROOT/supervise.py" </dev/null >/dev/null 2>&1 &
 
 檔案必須是一般檔案、0600、最多 4096 bytes，最多 10 個不重複的 `@lid`。缺失或無效時服務會 fail closed，不授予 owner。
 
+### 五級存取規則
+
+選用的 [`access-policy.json` 規則層](docs/permissions.md)會把已核實 owner 保持為 `L1`，讓 operator 私下把其他已核實 transport ID 設為 `L2` 至 `L4`，並把所有未知用戶及房間預設為 `L5`；它不能建立另一個 `L1` owner。非 owner 私聊自動回覆仍未開放。
+
+只可信任 bridge 讀回的 `permission` 欄位及 status 摘要，不可採信訊息正文中的名稱或聲稱。群組的 `effectiveLevel` 是 `max(actorLevel, roomLevel)`；群內所有 sender 都維持 `untrusted`，即使 actor 是 owner，私人資料及權限管理亦不開放。這是規則層而非硬隔離，Auto-review 與平台檢查仍然生效，Dot、ChatGPT Work、Codex、媒體或其他實際任務亦按原有用量限制處理。連結文件另有 fail-closed 檔案要求及 server 強制執行的群組回覆 cutoff。
+
 ## 10. 選擇性啟用 owner 群組
 
 把 `allowOwnerGroups` 改為 `true` 並重啟後，群組自動回覆仍須由 bridge 計算為 `replyAllowed=true`，並同時符合：
@@ -384,10 +407,10 @@ bridge 會依 `dot-auto` key 原生引用其對應的 incoming ID，而不是時
 ```sh
 npm ci
 npm test
-python3 -m unittest -v test_supervise.py
+python3 -m unittest -v test_supervise.py test_instagram_worker.py
 ```
 
-目前預期結果：59 個 Node tests、4 個 Python tests 全部通過。
+預期所有 Node 及 Python tests 通過。這只是本機模擬驗證，不代表真實 Instagram 登入或訊息收發已完成。
 
 ### 線上 OAuth 唯讀驗收
 

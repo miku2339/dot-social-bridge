@@ -34,18 +34,25 @@ export class EventSubscriptions {
     now = Date.now,
     uuid = randomUUID,
     retryBaseMs = 1_000,
+    adapter = null,
+    canDeliver = null,
   } = {}) {
     if (typeof dataDir !== "string" || dataDir.length === 0) {
       throw new TypeError("dataDir is required");
     }
+    if (canDeliver !== null && typeof canDeliver !== "function") {
+      throw new TypeError("canDeliver must be a function");
+    }
+    this.adapter = adapter ?? WHATSAPP_EVENT_ADAPTER;
     this.dataDir = dataDir;
-    this.statePath = path.join(dataDir, "events-state.json");
+    this.statePath = path.join(dataDir, this.adapter.stateFileName);
     this.logger = logger;
     this.transport = transport;
     this.dnsLookup = dnsLookup;
     this.now = now;
     this.uuid = uuid;
     this.retryBaseMs = retryBaseMs;
+    this.canDeliver = canDeliver;
     this.subscriptions = new Map();
     this.queue = [];
     this.seen = new Map();
@@ -61,6 +68,8 @@ export class EventSubscriptions {
     this.drainPromise = null;
     this.timer = null;
     this.persistChain = Promise.resolve();
+    this.stateChain = Promise.resolve();
+    this.persistenceDirty = false;
   }
 
   list(params = {}) {
@@ -72,8 +81,8 @@ export class EventSubscriptions {
     }
     return {
       events: [
-        {
-          name: EVENT_NAME,
+        this.adapter.definition ?? {
+          name: this.adapter.name,
           description: "A new incoming WhatsApp text or media message in a selected chat, or a trusted owner group message approved for reply by the bridge.",
           delivery: ["webhook"],
           inputSchema: {
@@ -144,64 +153,64 @@ export class EventSubscriptions {
 
   async subscribe(params, principal) {
     const owner = validatePrincipal(principal);
-    const request = validateSubscriptionParams(params);
+    const request = validateSubscriptionParams(params, this.adapter);
     const id = subscriptionId(owner, request);
-    const now = this.now();
-    const existing = this.subscriptions.get(id);
     const ttlMs = grantedTtl(params.ttlMs);
-    const expiresAt = now + ttlMs;
-    const candidate = {
-      id,
-      principal: owner,
-      name: EVENT_NAME,
-      arguments: request.arguments,
-      url: request.url,
-      secret: request.secret,
-      expiresAt,
-      active: false,
-      verifiedAt: null,
-    };
-
-    const recentlyVerified = existing?.secret === candidate.secret &&
-      Number.isFinite(existing.verifiedAt) && existing.verifiedAt + VERIFICATION_CACHE_MS > now;
-    if (!recentlyVerified) await this.#verifyCallback(candidate);
-    candidate.active = true;
-    candidate.verifiedAt = recentlyVerified ? existing.verifiedAt : this.now();
-    this.subscriptions.set(id, candidate);
-    await this.#persist();
-
-    return {
-      id,
-      refreshBefore: new Date(expiresAt).toISOString(),
-      cursor: null,
-      truncated: false,
-    };
+    return this.#commit(async (state, markChanged) => {
+      const now = this.now();
+      const existing = state.subscriptions.get(id);
+      const expiresAt = now + ttlMs;
+      const candidate = {
+        id,
+        principal: owner,
+        name: this.adapter.name,
+        arguments: request.arguments,
+        url: request.url,
+        secret: request.secret,
+        expiresAt,
+        active: false,
+        verifiedAt: null,
+      };
+      const recentlyVerified = existing?.secret === candidate.secret &&
+        Number.isFinite(existing.verifiedAt) && existing.verifiedAt + VERIFICATION_CACHE_MS > now;
+      if (!recentlyVerified) await this.#verifyCallback(candidate);
+      candidate.active = true;
+      candidate.verifiedAt = recentlyVerified ? existing.verifiedAt : this.now();
+      state.subscriptions.set(id, candidate);
+      markChanged();
+      return {
+        id,
+        refreshBefore: new Date(expiresAt).toISOString(),
+        cursor: null,
+        truncated: false,
+      };
+    });
   }
 
   async unsubscribe(params, principal) {
     const owner = validatePrincipal(principal);
-    const request = validateSubscriptionParams(params, { requireSecret: false });
+    const request = validateSubscriptionParams(params, this.adapter, { requireSecret: false });
     const id = subscriptionId(owner, request);
-    const existing = this.subscriptions.get(id);
-    if (existing && existing.principal === owner) {
-      this.subscriptions.delete(id);
-      this.queue = this.queue.filter((item) => item.subscriptionId !== id);
-      await this.#persist();
-      this.#schedule();
-    }
+    await this.#commit((state, markChanged) => {
+      const existing = state.subscriptions.get(id);
+      if (!existing || existing.principal !== owner) return {};
+      state.subscriptions.delete(id);
+      state.queue = state.queue.filter((item) => item.subscriptionId !== id);
+      markChanged();
+      return {};
+    });
+    this.#schedule();
     return {};
   }
 
   async publish(normalizedMessage) {
-    const message = normalizeMessage(normalizedMessage);
+    const message = this.adapter.normalizeMessage(normalizedMessage);
     if (!message) return { queued: 0, dropped: 0, filtered: true };
 
-    const eventId = upstreamEventId(message);
-    if (this.seen.has(eventId)) return { queued: 0, dropped: 0, duplicate: true };
-
+    const eventId = this.adapter.eventId(message);
     const event = {
       eventId,
-      name: EVENT_NAME,
+      name: this.adapter.name,
       timestamp: message.timestamp,
       data: message,
       cursor: null,
@@ -211,37 +220,37 @@ export class EventSubscriptions {
       throw invalidParams("Event payload exceeds 256 KiB");
     }
 
-    const now = this.now();
-    this.#removeExpired(now);
-    this.#pruneSeen(now);
-    this.seen.set(eventId, now);
-
-    let queued = 0;
-    let dropped = 0;
-    for (const subscription of this.subscriptions.values()) {
-      if (!subscription.active || subscription.expiresAt <= now) continue;
-      if (!subscriptionMatchesMessage(subscription, message)) continue;
-      if (this.queue.length >= MAX_QUEUE) {
-        dropped += 1;
-        this.health.lostEvents += 1;
-        continue;
+    const result = await this.#commit((state, markChanged) => {
+      if (state.seen.has(eventId)) return { queued: 0, dropped: 0, duplicate: true };
+      const now = this.now();
+      this.#removeExpired(now, state);
+      this.#pruneSeen(now, state);
+      state.seen.set(eventId, now);
+      markChanged();
+      let queued = 0;
+      let dropped = 0;
+      for (const subscription of state.subscriptions.values()) {
+        if (!subscription.active || subscription.expiresAt <= now) continue;
+        if (!this.adapter.matchesMessage(subscription, message)) continue;
+        if (state.queue.length >= MAX_QUEUE) {
+          dropped += 1;
+          state.health.lostEvents += 1;
+          continue;
+        }
+        state.queue.push({
+          id: `delivery_${this.uuid()}`,
+          subscriptionId: subscription.id,
+          event,
+          attempts: 0,
+          nextAttemptAt: now,
+        });
+        queued += 1;
       }
-      this.queue.push({
-        id: `delivery_${this.uuid()}`,
-        subscriptionId: subscription.id,
-        event,
-        attempts: 0,
-        nextAttemptAt: now,
-      });
-      queued += 1;
-    }
-
-    if (dropped > 0) {
-      this.logger.error?.({ dropped }, "MCP Events queue full; event delivery was dropped");
-    }
-    await this.#persist();
+      return { queued, dropped };
+    });
+    if (result.dropped > 0) this.logger.error?.({ dropped: result.dropped }, "MCP Events queue full; event delivery was dropped");
     this.#schedule();
-    return { queued, dropped };
+    return result;
   }
 
   async start() {
@@ -273,7 +282,10 @@ export class EventSubscriptions {
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
     if (this.drainPromise) await this.drainPromise;
-    await this.#persist();
+    await this.#serializeState(async () => {
+      await this.#persist();
+      this.persistenceDirty = false;
+    });
     await this.persistChain;
   }
 
@@ -346,6 +358,7 @@ export class EventSubscriptions {
     const deadlines = [
       ...this.queue.map((item) => item.nextAttemptAt),
       ...[...this.subscriptions.values()].map((subscription) => subscription.expiresAt),
+      ...(this.persistenceDirty ? [this.now() + Math.max(10, this.retryBaseMs)] : []),
     ];
     if (deadlines.length === 0) return;
     const next = Math.min(...deadlines);
@@ -366,48 +379,8 @@ export class EventSubscriptions {
     this.processing = true;
     try {
       while (this.started && !this.stopping) {
-        const now = this.now();
-        if (this.#removeExpired(now)) await this.#persist();
-        const index = this.queue.findIndex((item) => item.nextAttemptAt <= now);
-        if (index === -1) break;
-        const item = this.queue[index];
-        const subscription = this.subscriptions.get(item.subscriptionId);
-        if (!subscription || !subscription.active || subscription.expiresAt <= now) {
-          this.queue.splice(index, 1);
-          await this.#persist();
-          continue;
-        }
-
-        const body = JSON.stringify(item.event);
-        let result;
-        let reason = "transport_error";
-        try {
-          result = await this.#send(subscription, item.event.eventId, body);
-          reason = result.status >= 500 ? "http_5xx" : "http_4xx";
-        } catch (error) {
-          reason = categorizeTransportError(error);
-        }
-
-        const currentIndex = this.queue.findIndex((queued) => queued.id === item.id);
-        if (currentIndex === -1) continue;
-        if (result && result.status >= 200 && result.status < 300) {
-          this.queue.splice(currentIndex, 1);
-          this.health.lastDeliveryError = null;
-        } else if (result && (result.status === 410 || result.status === 413)) {
-          this.queue.splice(currentIndex, 1);
-          this.health.failedDeliveries += 1;
-          this.health.lastDeliveryError = `http_${result.status}`;
-        } else {
-          item.attempts += 1;
-          if (item.attempts >= MAX_ATTEMPTS) {
-            this.queue.splice(currentIndex, 1);
-            this.health.failedDeliveries += 1;
-          } else {
-            item.nextAttemptAt = this.now() + this.retryBaseMs * 2 ** (item.attempts - 1);
-          }
-          this.health.lastDeliveryError = reason;
-        }
-        await this.#persist();
+        const processed = await this.#serializeState(() => this.#drainOne());
+        if (!processed) break;
       }
     } finally {
       this.processing = false;
@@ -415,28 +388,103 @@ export class EventSubscriptions {
     }
   }
 
-  #removeExpired(now) {
+  async #drainOne() {
+    if (this.persistenceDirty) {
+      await this.#persistDrainState();
+    }
+    const now = this.now();
+    const expired = this.#removeExpired(now);
+    const index = this.queue.findIndex((item) => item.nextAttemptAt <= now);
+    if (index === -1) {
+      if (expired) await this.#persistDrainState();
+      return false;
+    }
+    const item = this.queue[index];
+    const subscription = this.subscriptions.get(item.subscriptionId);
+    if (!subscription || !subscription.active || subscription.expiresAt <= now) {
+      this.queue.splice(index, 1);
+      await this.#persistDrainState();
+      return true;
+    }
+
+    if (this.canDeliver) {
+      let allowed = false;
+      try {
+        allowed = await this.canDeliver(item.event.data) === true;
+      } catch {
+        allowed = false;
+      }
+      if (!allowed) {
+        this.queue.splice(index, 1);
+        await this.#persistDrainState();
+        return true;
+      }
+    }
+
+    const body = JSON.stringify(item.event);
+    let result;
+    let reason = "transport_error";
+    try {
+      result = await this.#send(subscription, item.event.eventId, body);
+      reason = result.status >= 500 ? "http_5xx" : "http_4xx";
+    } catch (error) {
+      reason = categorizeTransportError(error);
+    }
+    const currentIndex = this.queue.findIndex((queued) => queued.id === item.id);
+    if (currentIndex === -1) return true;
+    if (result && result.status >= 200 && result.status < 300) {
+      this.queue.splice(currentIndex, 1);
+      this.health.lastDeliveryError = null;
+    } else if (result && (result.status === 410 || result.status === 413)) {
+      this.queue.splice(currentIndex, 1);
+      this.health.failedDeliveries += 1;
+      this.health.lastDeliveryError = `http_${result.status}`;
+    } else {
+      item.attempts += 1;
+      if (item.attempts >= MAX_ATTEMPTS) {
+        this.queue.splice(currentIndex, 1);
+        this.health.failedDeliveries += 1;
+      } else {
+        item.nextAttemptAt = this.now() + this.retryBaseMs * 2 ** (item.attempts - 1);
+      }
+      this.health.lastDeliveryError = reason;
+    }
+    await this.#persistDrainState();
+    return true;
+  }
+
+  async #persistDrainState() {
+    try {
+      await this.#persist();
+      this.persistenceDirty = false;
+    } catch (error) {
+      this.persistenceDirty = true;
+      throw error;
+    }
+  }
+
+  #removeExpired(now, state = this) {
     const expired = new Set();
-    for (const [id, subscription] of this.subscriptions) {
+    for (const [id, subscription] of state.subscriptions) {
       if (subscription.expiresAt <= now) {
-        this.subscriptions.delete(id);
+        state.subscriptions.delete(id);
         expired.add(id);
       }
     }
     if (expired.size > 0) {
-      this.queue = this.queue.filter((item) => !expired.has(item.subscriptionId));
+      state.queue = state.queue.filter((item) => !expired.has(item.subscriptionId));
     }
     return expired.size > 0;
   }
 
-  #pruneSeen(now) {
+  #pruneSeen(now, state = this) {
     const cutoff = now - MAX_TTL_MS;
-    for (const [eventId, seenAt] of this.seen) {
-      if (seenAt < cutoff) this.seen.delete(eventId);
+    for (const [eventId, seenAt] of state.seen) {
+      if (seenAt < cutoff) state.seen.delete(eventId);
     }
-    if (this.seen.size > 2_000) {
-      const entries = [...this.seen.entries()].sort((a, b) => a[1] - b[1]);
-      for (const [eventId] of entries.slice(0, this.seen.size - 2_000)) this.seen.delete(eventId);
+    if (state.seen.size > 2_000) {
+      const entries = [...state.seen.entries()].sort((a, b) => a[1] - b[1]);
+      for (const [eventId] of entries.slice(0, state.seen.size - 2_000)) state.seen.delete(eventId);
     }
   }
 
@@ -446,15 +494,15 @@ export class EventSubscriptions {
     }
     this.subscriptions.clear();
     for (const subscription of state.subscriptions) {
-      if (isStoredSubscription(subscription)) this.subscriptions.set(subscription.id, subscription);
+      if (isStoredSubscription(subscription, this.adapter)) this.subscriptions.set(subscription.id, subscription);
     }
     this.queue = [];
     for (const item of state.queue) {
-      if (!isStoredDelivery(item)) continue;
+      if (!isStoredDelivery(item, this.adapter)) continue;
       const subscription = this.subscriptions.get(item.subscriptionId);
       if (!subscription) continue;
-      const restored = normalizeStoredDelivery(item);
-      if (!restored || !subscriptionMatchesMessage(subscription, restored.event.data)) continue;
+      const restored = normalizeStoredDelivery(item, this.adapter);
+      if (!restored || !this.adapter.matchesMessage(subscription, restored.event.data)) continue;
       this.queue.push(restored);
       if (this.queue.length >= MAX_QUEUE) break;
     }
@@ -467,24 +515,66 @@ export class EventSubscriptions {
     };
   }
 
-  async #persist() {
+  #cloneState() {
+    return {
+      subscriptions: new Map([...this.subscriptions].map(([id, value]) => [id, structuredClone(value)])),
+      queue: structuredClone(this.queue),
+      seen: new Map(this.seen),
+      health: structuredClone(this.health),
+    };
+  }
+
+  #applyState(state) {
+    this.subscriptions = state.subscriptions;
+    this.queue = state.queue;
+    this.seen = state.seen;
+    this.health = state.health;
+  }
+
+  async #commit(mutate) {
+    return this.#serializeState(async () => {
+      const candidate = this.#cloneState();
+      let changed = false;
+      const result = await mutate(candidate, () => { changed = true; });
+      if (!changed) return result;
+      await this.#persist(candidate);
+      candidate.health.lastPersistenceError = null;
+      this.#applyState(candidate);
+      this.persistenceDirty = false;
+      return result;
+    });
+  }
+
+  async #serializeState(operation) {
+    const previous = this.stateChain;
+    let release;
+    this.stateChain = new Promise((resolve) => { release = resolve; });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
+  async #persist(state = this) {
     const operation = this.persistChain.then(async () => {
       await fs.mkdir(this.dataDir, { recursive: true, mode: 0o700 });
       await fs.chmod(this.dataDir, 0o700);
-      const state = {
+      const serialized = {
         version: STATE_VERSION,
-        subscriptions: [...this.subscriptions.values()],
-        queue: this.queue,
-        seen: [...this.seen.entries()],
+        subscriptions: [...state.subscriptions.values()],
+        queue: state.queue,
+        seen: [...state.seen.entries()],
         health: {
-          lostEvents: this.health.lostEvents,
-          failedDeliveries: this.health.failedDeliveries,
-          lastDeliveryError: this.health.lastDeliveryError,
+          lostEvents: state.health.lostEvents,
+          failedDeliveries: state.health.failedDeliveries,
+          lastDeliveryError: state.health.lastDeliveryError,
         },
       };
       const temporaryPath = `${this.statePath}.${process.pid}.${this.uuid()}.tmp`;
       try {
-        await fs.writeFile(temporaryPath, `${JSON.stringify(state)}\n`, { mode: 0o600, flag: "wx" });
+        await fs.writeFile(temporaryPath, `${JSON.stringify(serialized)}\n`, { mode: 0o600, flag: "wx" });
         await fs.chmod(temporaryPath, 0o600);
         await fs.rename(temporaryPath, this.statePath);
         await fs.chmod(this.statePath, 0o600);
@@ -507,9 +597,9 @@ function validatePrincipal(principal) {
   return principal;
 }
 
-function validateSubscriptionParams(params, { requireSecret = true } = {}) {
+function validateSubscriptionParams(params, adapter, { requireSecret = true } = {}) {
   if (!params || typeof params !== "object" || Array.isArray(params)) throw invalidParams("Invalid subscription params");
-  if (params.name !== EVENT_NAME) {
+  if (params.name !== adapter.name) {
     throw new EventsError(-32023, "NotFound", { kind: "event" });
   }
   if (!params.delivery || params.delivery.mode !== "webhook") {
@@ -517,12 +607,12 @@ function validateSubscriptionParams(params, { requireSecret = true } = {}) {
   }
   const url = validateCallbackUrl(params.delivery.url);
   const secret = requireSecret ? validateSecret(params.delivery.secret) : null;
-  const argumentsValue = validateArguments(params.arguments);
+  const argumentsValue = adapter.validateArguments(params.arguments);
   if (params.cursor !== undefined && params.cursor !== null) throw invalidParams("Replay cursors are not supported");
   if (params.ttlMs !== undefined && params.ttlMs !== null && (!Number.isFinite(params.ttlMs) || params.ttlMs <= 0)) {
     throw invalidParams("ttlMs must be a positive finite number");
   }
-  return { name: EVENT_NAME, arguments: argumentsValue, url, secret };
+  return { name: adapter.name, arguments: argumentsValue, url, secret };
 }
 
 function validateArguments(value) {
@@ -837,9 +927,9 @@ function categorizeTransportError(error) {
   return "connection_refused";
 }
 
-function isStoredSubscription(value) {
-  return value && typeof value.id === "string" && typeof value.principal === "string" && value.name === EVENT_NAME &&
-    isStoredArguments(value.arguments) && typeof value.url === "string" && typeof value.secret === "string" &&
+function isStoredSubscription(value, adapter) {
+  return value && typeof value.id === "string" && typeof value.principal === "string" && value.name === adapter.name &&
+    adapter.isStoredArguments(value.arguments) && typeof value.url === "string" && typeof value.secret === "string" &&
     Number.isFinite(value.expiresAt) && value.active === true;
 }
 
@@ -854,22 +944,22 @@ function isStoredArguments(value) {
     (validChatIds || value.ownerGroups === true);
 }
 
-function isStoredDelivery(value) {
+function isStoredDelivery(value, adapter) {
   return value && typeof value.id === "string" && typeof value.subscriptionId === "string" &&
-    value.event?.name === EVENT_NAME && typeof value.event?.eventId === "string" && Number.isInteger(value.attempts) &&
+    value.event?.name === adapter.name && typeof value.event?.eventId === "string" && Number.isInteger(value.attempts) &&
     Number.isFinite(value.nextAttemptAt);
 }
 
-function normalizeStoredDelivery(value) {
+function normalizeStoredDelivery(value, adapter) {
   try {
-    const data = normalizeMessage(value.event.data);
+    const data = (adapter.normalizeStoredMessage ?? adapter.normalizeMessage)(value.event.data);
     if (!data) return null;
     return {
       id: value.id,
       subscriptionId: value.subscriptionId,
       event: {
         eventId: value.event.eventId,
-        name: EVENT_NAME,
+        name: adapter.name,
         timestamp: data.timestamp,
         data,
         cursor: null,
@@ -889,5 +979,16 @@ function isSeenEntry(value) {
 function nonNegativeInteger(value) {
   return Number.isInteger(value) && value >= 0 ? value : 0;
 }
+
+const WHATSAPP_EVENT_ADAPTER = Object.freeze({
+  name: EVENT_NAME,
+  stateFileName: "events-state.json",
+  definition: null,
+  validateArguments,
+  isStoredArguments,
+  normalizeMessage,
+  matchesMessage: subscriptionMatchesMessage,
+  eventId: upstreamEventId,
+});
 
 export const __test = { isPublicIp, signWebhook };

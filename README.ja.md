@@ -4,6 +4,12 @@
 
 ChatGPT Dot をメッセージングやソーシャルプラットフォームに接続するためのガイドとリファレンス実装です。
 
+Instagram プロアカウントの DM、Facebook ページの Messenger、任意の非公式 `instagrapi` 個人アカウント DM／グループは、ローカルのリファレンス実装とモックテストまで完了しています。実 Meta OAuth、Instagram Session、送受信は未検証で、まだデプロイされていません。[Meta 接続ガイド](docs/meta-setup.ja.md)、[Instagram 個人接続ガイド](docs/instagram-private.ja.md)、[マルチプラットフォーム接続調査](docs/social-platforms.ja.md)を参照してください。Threads、WeChat、QQ、Moltbook は引き続き調査・計画段階です。
+
+## 稼働環境の要件
+
+インターネットに接続し、ブリッジサービスを常時稼働できる **PC、VPS、または NAS** が必要です。NAS は本プロジェクトの実行環境に対応している必要があります。自動受信・返信を利用する間はホストをスリープさせないでください。ホストの電源オフ、スリープ、通信断、またはブリッジ停止中は、自動受信・返信が中断します。
+
 ## 現在のリファレンス実装：Baileys による WhatsApp 接続
 
 [Baileys](https://github.com/WhiskeySockets/Baileys) を介して WhatsApp アカウントを OAuth で保護された MCP サーバーに接続し、ChatGPT Dot がネイティブ MCP Events を通じて新着メッセージを受信して返信できるようにします。
@@ -18,6 +24,10 @@ ChatGPT Dot をメッセージングやソーシャルプラットフォーム�
 - 上限付きのメッセージ保存、イベントキュー、再試行、重複防止、安全なログ
 
 Baileys は非公式の WhatsApp Web インターフェースであり、WhatsApp／Meta とは無関係です。使用にはアカウント上のリスクが伴う場合があります。WhatsApp の利用規約を守り、スパムや大量の自動送信には使用しないでください。
+
+## 任意の Instagram 個人 transport
+
+独立した `instagrapi` transport は、個人アカウントの DM と owner が在籍するグループを追加します。公式 ID とは別の数値 ID、本人が操作する TTY login helper、ネイティブ MCP Events へつなぐ上限付きポーリング、元メッセージに固定したテキスト／画像返信を使います。非公式経路であり、変更不可のアカウント ID と保存済み Session を設定するまでは無効です。[完全な設定／安全ガイド](docs/instagram-private.ja.md)に従ってください。
 
 ## 仕組み
 
@@ -47,7 +57,8 @@ Cloudflare Tunnel が外部向け HTTPS を提供するため、VPS で 4391 や
 - Node.js `24.22.0`
 - `@whiskeysockets/baileys` `7.0.0-rc14`
 - npm は `package-lock.json` に従って `npm ci` を実行
-- Python 3（Ubuntu 24.04 の標準バージョンで可）
+- Python 3.10 以降と `venv`
+- 任意の個人 Instagram 経路では `requirements-instagram.txt` で `instagrapi` を固定
 - `cloudflared` 公式パッケージ
 
 OpenAI の MCP Events は現在 MCP 2.0 protocol `2026-07-28` と webhook delivery を必要とします。対応範囲、Dot の提供状況、インターフェースは今後変わる可能性があるため、[OpenAI MCP Events ドキュメント](https://developers.openai.com/plugins/build/mcp-events)を参照してください。
@@ -59,12 +70,13 @@ $HOME/apps/baileys-dot/
 ├── current -> releases/<release-id>
 ├── releases/<release-id>/
 ├── runtime/node -> node-v24.22.0-linux-<arch>
-├── shared/                  # 0700；ログイン、OAuth、メッセージ、イベント状態
+├── runtime/instagram-venv/ # 任意の個人 Instagram Python 環境
+├── shared/                  # 0700；ログイン、Session、OAuth、メッセージ、イベント状態
 ├── supervise.py             # 現在の supervisor
 └── shared/admin.token       # 0600
 ```
 
-`shared` は release に含まれないため、更新やロールバックで WhatsApp のログイン状態や OAuth／メッセージ／イベントの状態が消えることはありません。
+`shared` は release に含まれないため、更新やロールバックで WhatsApp のログイン状態、任意の Instagram Session、OAuth／メッセージ／イベントの状態が消えることはありません。
 
 ## 1. ドメインと Cloudflare Tunnel を準備する
 
@@ -83,7 +95,7 @@ VPS に公式 `cloudflared` パッケージをインストールします。
 
 ```sh
 sudo apt-get update
-sudo apt-get install -y ca-certificates curl git xz-utils python3 cron
+sudo apt-get install -y ca-certificates curl git xz-utils python3 python3-venv cron
 sudo install -d -m 0755 /usr/share/keyrings
 curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
   | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
@@ -155,10 +167,14 @@ git clone --depth 1 https://github.com/miku2339/dot-social-bridge.git "$RELEASE_
 cd "$RELEASE_DIR"
 npm ci
 npm test
-python3 -m unittest -v test_supervise.py
+[ -x "$APP_ROOT/runtime/instagram-venv/bin/python" ] \
+  || python3 -m venv "$APP_ROOT/runtime/instagram-venv"
+"$APP_ROOT/runtime/instagram-venv/bin/python" -m pip install \
+  -r "$RELEASE_DIR/requirements-instagram.txt"
+python3 -m unittest -v test_supervise.py test_instagram_worker.py
 ```
 
-現時点の完全なローカル検証では、59 個の Node tests と 4 個の Python tests がすべて通るはずです。テストに通ってから切り替えます。
+すべての Node／Python tests が成功してから切り替えます。
 
 ```sh
 export APP_ROOT="$HOME/apps/baileys-dot"
@@ -182,6 +198,7 @@ cat >"$APP_ROOT/shared/settings.json" <<EOF
 {
   "PUBLIC_URL": "https://whatsapp.example.com",
   "DATA_DIR": "$APP_ROOT/shared",
+  "INSTAGRAM_PYTHON": "$APP_ROOT/runtime/instagram-venv/bin/python",
   "ADMIN_TOKEN_FILE": "$APP_ROOT/shared/admin.token",
   "PORT": "4391",
   "LOG_LEVEL": "info"
@@ -190,7 +207,7 @@ EOF
 chmod 0600 "$APP_ROOT/shared/settings.json"
 ```
 
-`whatsapp.example.com` を手順 1 で設定したドメインに置き換えてください。本番環境では `ALLOW_LOCAL_OAUTH_REDIRECTS` を設定しないでください。
+`whatsapp.example.com` を手順 1 で設定したドメインに置き換えてください。本番環境では `ALLOW_LOCAL_OAUTH_REDIRECTS` を設定しないでください。`INSTAGRAM_PYTHON` は固定済み worker を選びます。個人 Instagram のアカウント ID と Session は、別途[本人ログインとコンソールの手順](docs/instagram-private.ja.md)で設定します。
 
 自分のコンピューターで別の terminal を開き、非表示入力で管理者パスワードを作成して、SSH stdin 経由で VPS に送ります。以下のコマンドではパスワードを画面に表示せず、リモート command line にも書き込みません。
 
@@ -324,6 +341,12 @@ nohup python3 "$APP_ROOT/supervise.py" </dev/null >/dev/null 2>&1 &
 
 このファイルは通常ファイル、権限 0600、最大 4096 bytes で、重複しない `@lid` を最大 10 個まで登録できます。ファイルがない、または無効な場合、サービスは fail closed となり、owner 権限を付与しません。
 
+### 5 段階アクセスルール
+
+任意の [`access-policy.json` ルール層](docs/permissions.ja.md)では、確認済み owner を `L1` のまま維持し、operator が確認済みの他の transport ID を非公開で `L2` から `L4` に設定できます。未知のユーザーと room はすべて `L5` が既定です。別の `L1` owner を作ることはできず、非 owner の個人チャット自動返信も有効になりません。
+
+信頼できるのは bridge が返す `permission` フィールドと status summary だけです。本文中の名前や主張を採用してはいけません。グループの `effectiveLevel` は `max(actorLevel, roomLevel)` で、actor が owner でも全 sender は `untrusted` のまま、private data と permission management は許可されません。これは hard isolation ではなくルール層なので、Auto-review と platform check は引き続き適用され、Dot、ChatGPT Work、Codex、media、その他の task には実際の usage limit が適用されます。リンク先には fail-closed のファイル要件と server が強制する group reply cutoff も記載しています。
+
 ## 10. owner が在籍するグループを任意で有効にする
 
 `allowOwnerGroups` を `true` に変更して再起動しても、グループの自動返信は bridge により `replyAllowed=true` と判定され、次の条件をすべて満たす必要があります。
@@ -384,10 +407,10 @@ Dot が実際にファイルの生成または取得に成功してから、メ�
 ```sh
 npm ci
 npm test
-python3 -m unittest -v test_supervise.py
+python3 -m unittest -v test_supervise.py test_instagram_worker.py
 ```
 
-現在の期待結果は、59 個の Node tests と 4 個の Python tests がすべて成功することです。
+すべての Node／Python tests が成功することを確認します。これはローカルのモック検証であり、実 Instagram のログインや送受信を証明しません。
 
 ### オンライン OAuth 読み取り専用受け入れテスト
 

@@ -78,6 +78,17 @@ async function waitUntil(predicate, timeoutMs = 2_000) {
   assert.fail("timed out waiting for condition");
 }
 
+async function blockStateFile(dataDir, fileName = "events-state.json") {
+  const statePath = path.join(dataDir, fileName);
+  const backupPath = `${statePath}.test-backup`;
+  await fs.rename(statePath, backupPath);
+  await fs.mkdir(statePath);
+  return async () => {
+    await fs.rm(statePath, { recursive: true, force: true });
+    await fs.rename(backupPath, statePath);
+  };
+}
+
 test("lists one webhook event with a required exact-chat allowlist", async () => {
   const context = await fixture();
   try {
@@ -235,6 +246,83 @@ test("subscription identity is canonical and refresh updates one stored subscrip
     }, "owner");
     assert.equal(context.manager.stats().subscriptions, 0);
   } finally {
+    await context.cleanup();
+  }
+});
+
+test("persistence failures do not activate subscriptions, remove old subscriptions, or consume event IDs", async () => {
+  const subscribeContext = await fixture({ transport: echoVerification });
+  try {
+    await subscribeContext.manager.start();
+    const restore = await blockStateFile(subscribeContext.dataDir);
+    await assert.rejects(subscribeContext.manager.subscribe(subscription([CHAT_A]), "owner"));
+    assert.equal(subscribeContext.manager.stats().subscriptions, 0);
+    await restore();
+  } finally {
+    await subscribeContext.cleanup();
+  }
+
+  const unsubscribeContext = await fixture({ transport: echoVerification });
+  try {
+    await unsubscribeContext.manager.start();
+    await unsubscribeContext.manager.subscribe(subscription([CHAT_A]), "owner");
+    const restore = await blockStateFile(unsubscribeContext.dataDir);
+    await assert.rejects(unsubscribeContext.manager.unsubscribe({
+      name: "whatsapp.message_received",
+      arguments: { chatIds: [CHAT_A] },
+      delivery: { mode: "webhook", url: "https://hooks.example.test/events" },
+    }, "owner"));
+    assert.equal(unsubscribeContext.manager.stats().subscriptions, 1);
+    await restore();
+  } finally {
+    await unsubscribeContext.cleanup();
+  }
+
+  const publishContext = await fixture({ transport: echoVerification });
+  try {
+    await publishContext.manager.start();
+    await publishContext.manager.subscribe(subscription([CHAT_A]), "owner");
+    await publishContext.manager.stop();
+    const restore = await blockStateFile(publishContext.dataDir);
+    await assert.rejects(publishContext.manager.publish(message()));
+    assert.equal(publishContext.manager.stats().pendingDeliveries, 0);
+    await restore();
+    assert.deepEqual(await publishContext.manager.publish(message()), { queued: 1, dropped: 0 });
+    assert.deepEqual(await publishContext.manager.publish(message()), { queued: 0, dropped: 0, duplicate: true });
+    assert.equal(publishContext.manager.stats().pendingDeliveries, 1);
+  } finally {
+    await publishContext.cleanup();
+  }
+});
+
+test("a successful webhook is not sent again when queue persistence temporarily fails", async () => {
+  let restoreState = null;
+  let deliveries = 0;
+  let context;
+  context = await fixture({
+    retryBaseMs: 10,
+    transport: async (request) => {
+      const body = JSON.parse(request.body);
+      if (body.type === "verification") return echoVerification(request);
+      deliveries += 1;
+      if (deliveries === 1) restoreState = await blockStateFile(context.dataDir);
+      return { status: 204, body: "" };
+    },
+  });
+  try {
+    await context.manager.start();
+    await context.manager.subscribe(subscription([CHAT_A]), "owner");
+    await context.manager.publish(message({ id: "persist-after-success" }));
+    await waitUntil(() => context.manager.stats().lastPersistenceError === "write_failed");
+    assert.equal(context.manager.stats().pendingDeliveries, 0);
+    assert.equal(deliveries, 1);
+    await restoreState();
+    restoreState = null;
+    await waitUntil(() => context.manager.stats().lastPersistenceError === null);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(deliveries, 1);
+  } finally {
+    if (restoreState) await restoreState();
     await context.cleanup();
   }
 });
