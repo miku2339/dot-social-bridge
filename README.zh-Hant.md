@@ -171,7 +171,7 @@ npm test
   || python3 -m venv "$APP_ROOT/runtime/instagram-venv"
 "$APP_ROOT/runtime/instagram-venv/bin/python" -m pip install \
   -r "$RELEASE_DIR/requirements-instagram.txt"
-python3 -m unittest -v test_supervise.py test_instagram_worker.py
+"$APP_ROOT/runtime/instagram-venv/bin/python" -m unittest discover -v
 ```
 
 所有 Node 及 Python tests 通過後才切換：
@@ -407,7 +407,9 @@ bridge 會依 `dot-auto` key 原生引用其對應的 incoming ID，而不是時
 ```sh
 npm ci
 npm test
-python3 -m unittest -v test_supervise.py test_instagram_worker.py
+python3 -m venv .venv-instagram
+.venv-instagram/bin/python -m pip install -r requirements-instagram.txt
+.venv-instagram/bin/python -m unittest discover -v
 ```
 
 預期所有 Node 及 Python tests 通過。這只是本機模擬驗證，不代表真實 Instagram 登入或訊息收發已完成。

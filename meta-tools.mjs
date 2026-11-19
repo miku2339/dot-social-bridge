@@ -53,7 +53,7 @@ function file(value) {
   return result;
 }
 function result(value) {
-  const structuredContent = value && typeof value === "object" ? value : { result: value };
+  const structuredContent = value && typeof value === "object" && !Array.isArray(value) ? value : { result: value };
   return { content: [{ type: "text", text: JSON.stringify(structuredContent) }], structuredContent, isError: false };
 }
 function imageType(data) {

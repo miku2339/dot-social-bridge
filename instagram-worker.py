@@ -192,6 +192,10 @@ def _resolve_data_dir(value: str | None) -> Path | None:
 def _extract_url(source: Any, depth: int = 0) -> str | None:
     if source is None or depth > 5:
         return None
+    from pydantic import AnyUrl
+
+    if isinstance(source, AnyUrl):
+        source = str(source)
     if isinstance(source, str):
         try:
             from urllib.parse import urlsplit
@@ -457,6 +461,10 @@ class InstagramWorker:
                 if file_name:
                     media["fileName"] = file_name
                 result["media"] = media
+            elif text:
+                result["mediaType"] = None
+            else:
+                return None
         reply = _value(message, "reply")
         reply_id = _value(reply, "id")
         if isinstance(reply_id, str) and SAFE_MESSAGE_ID.fullmatch(reply_id):

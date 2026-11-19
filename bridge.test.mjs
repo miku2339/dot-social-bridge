@@ -2615,10 +2615,10 @@ test('rechecks pause synchronously after an in-flight store persist for every se
     const persistEntered = new Promise((resolve) => { enterPersist = resolve })
     const persistReleased = new Promise((resolve) => { releasePersist = resolve })
     const originalPersist = harness.bridge.store.persist.bind(harness.bridge.store)
-    harness.bridge.store.persist = async () => {
+    harness.bridge.store.persist = async (...args) => {
       enterPersist()
       await persistReleased
-      return originalPersist()
+      return originalPersist(...args)
     }
     const rejectedSend = assert.rejects(send(harness.bridge, sourceId), /paused/)
     await persistEntered
@@ -2689,4 +2689,163 @@ test('rechecks pause after asynchronous group metadata before returning pending 
   releaseMetadata()
   assert.deepEqual(await pending, [])
   await harness.bridge.stop()
+})
+
+test('redelivers an incoming message exactly once after a store write fails', async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'baileys-redelivery-'))
+  t.after(() => rm(dataDir, { recursive: true, force: true }))
+  const { bridge } = createHarness(dataDir)
+  await bridge.start()
+  const chatId = '123456789@lid'
+  const upsert = { type: 'notify', messages: [{
+    key: { remoteJid: chatId, id: 'retry', fromMe: false },
+    message: { conversation: 'hello' }
+  }] }
+  const emitted = []
+  bridge.on('message', (message) => emitted.push(message.id))
+  const file = bridge.store.file
+  bridge.store.file = join(dataDir, 'missing', 'store.json')
+  await assert.rejects(bridge._onMessages(upsert), { code: 'ENOENT' })
+  assert.deepEqual(bridge.getMessages({ chatId }), [])
+  assert.deepEqual(emitted, [])
+  bridge.store.file = file
+  await Promise.all([bridge._onMessages(upsert), bridge._onMessages(upsert)])
+  assert.deepEqual(emitted, ['retry'])
+  assert.deepEqual(JSON.parse(await readFile(file)).messages.map((message) => message.id), ['retry'])
+  await bridge.stop()
+})
+
+test('reuses the receipt when saving a confirmed send fails', async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'baileys-send-receipt-'))
+  t.after(() => rm(dataDir, { recursive: true, force: true }))
+  const harness = createHarness(dataDir)
+  const { bridge } = harness
+  await bridge.start()
+  const socket = harness.sockets[0]
+  socket.ev.emit('connection.update', { connection: 'open' })
+  const request = { chatId: '123456789@lid', text: 'hello', idempotencyKey: 'saved-receipt' }
+  const file = bridge.store.file
+  const sendMessage = socket.sendMessage.bind(socket)
+  socket.sendMessage = async (...args) => {
+    const result = await sendMessage(...args)
+    bridge.store.file = join(dataDir, 'missing', 'store.json')
+    return result
+  }
+  await assert.rejects(bridge.sendText(request), { code: 'ENOENT' })
+  bridge.store.file = file
+  assert.equal(await bridge.sendText(request), harness.sentMessages[0].options.messageId)
+  assert.equal(harness.sendCalls, 1)
+  await bridge.stop()
+})
+
+test('persists a send reservation before retrying after storage and transport failures', async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'baileys-send-retry-'))
+  t.after(() => rm(dataDir, { recursive: true, force: true }))
+  const first = createHarness(dataDir)
+  await first.bridge.start()
+  const socket = first.sockets[0]
+  socket.ev.emit('connection.update', { connection: 'open' })
+  const request = { chatId: '123456789@lid', text: 'hello', idempotencyKey: 'persist-before-send' }
+  const file = first.bridge.store.file
+  first.bridge.store.file = join(dataDir, 'missing', 'store.json')
+  await assert.rejects(first.bridge.sendText(request), { code: 'ENOENT' })
+  assert.equal(first.sendCalls, 0)
+  first.bridge.store.file = file
+
+  let attemptedId
+  socket.sendMessage = async (_chatId, _content, options) => {
+    attemptedId = options.messageId
+    const { idempotency } = JSON.parse(await readFile(file))
+    assert.equal(idempotency[request.idempotencyKey].messageId, attemptedId)
+    throw new Error('delivery not acknowledged')
+  }
+  await assert.rejects(first.bridge.sendText(request), /delivery not acknowledged/)
+  await first.bridge.stop()
+
+  const restarted = createHarness(dataDir)
+  await restarted.bridge.start()
+  restarted.sockets[0].ev.emit('connection.update', { connection: 'open' })
+  assert.equal(await restarted.bridge.sendText(request), attemptedId)
+  assert.equal(restarted.sentMessages[0].options.messageId, attemptedId)
+  await restarted.bridge.stop()
+})
+
+test('paginates by message ID across a tie and preserves exclusive timestamp cursors', async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'baileys-page-'))
+  t.after(() => rm(dataDir, { recursive: true, force: true }))
+  const { bridge } = createHarness(dataDir)
+  await bridge.start()
+  const chatId = '123456789@lid'
+  const now = Math.floor(Date.now() / 1000)
+  const incoming = (id, messageTimestamp) => ({
+    key: { remoteJid: chatId, id, fromMe: false }, message: { conversation: id }, messageTimestamp
+  })
+  await bridge._onMessages({ type: 'notify', messages: [
+    incoming('older', now - 1), incoming('first', now), incoming('second', now)
+  ] })
+  const page = (before) => bridge.getMessages({ chatId, limit: 1, before }).map((message) => message.id)
+  assert.deepEqual(page(), ['second'])
+  await bridge._onMessages({ type: 'notify', messages: [incoming('first', now)] })
+  assert.deepEqual(page('second'), ['first'])
+  assert.deepEqual(page('first'), ['older'])
+  assert.deepEqual(page(String(now)), ['older'])
+  await bridge.stop()
+})
+
+test('keeps the group subject when a participant sends a message', async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'baileys-group-name-'))
+  t.after(() => rm(dataDir, { recursive: true, force: true }))
+  const { bridge } = createHarness(dataDir)
+  await bridge.start()
+  const chatId = '123456789@g.us'
+  await bridge._onChats([{ id: chatId, name: 'Project A' }])
+  await bridge._onMessages({ type: 'notify', messages: [{
+    key: { remoteJid: chatId, participant: '123456789@lid', id: 'group-incoming', fromMe: false },
+    pushName: 'Alice', message: { conversation: 'hello' }
+  }] })
+  assert.equal(bridge.getMessages({ chatId })[0].pushName, 'Alice')
+  assert.equal(bridge.listChats()[0].name, 'Project A')
+  assert.equal(bridge.getConsoleState().groups[0].name, 'Project A')
+  await bridge.stop()
+})
+
+test('expires media at the retention deadline while idle and during restart', async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'baileys-idle-retention-'))
+  t.after(() => rm(dataDir, { recursive: true, force: true }))
+  const now = Date.now()
+  const retention = 7 * 24 * 60 * 60 * 1000
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now })
+  const chatId = '123456789@lid'
+  await writeFile(join(dataDir, 'owner-identities.json'), JSON.stringify({
+    version: 1, ownerIds: [chatId]
+  }), { mode: 0o600 })
+  const { bridge, downloadCalls } = createHarness(dataDir)
+  await bridge.start()
+  const incoming = (id, messageTimestamp) => ({
+    key: { remoteJid: chatId, id, fromMe: false }, messageTimestamp,
+    message: { imageMessage: { mediaKey: Buffer.alloc(32), directPath: '/photo', mimetype: 'image/png' } }
+  })
+  await bridge._onMessages({ type: 'notify', messages: [
+    incoming('idle', now - 1000), incoming('offline', now)
+  ] })
+  const stored = async () => JSON.parse(await readFile(join(dataDir, 'store.json')))
+  assert.equal(Object.keys((await stored()).mediaDownloads).length, 2)
+
+  t.mock.timers.setTime(now + retention - 1000)
+  await assert.rejects(bridge.getMedia({ chatId, messageId: 'idle' }), /unavailable/)
+  assert.equal(downloadCalls.length, 0)
+  t.mock.timers.tick(0)
+  await bridge.mutationQueue
+  const afterCleanup = await stored()
+  assert.equal(Object.keys(afterCleanup.mediaDownloads).length, 1)
+  assert.deepEqual(afterCleanup.messages.map((message) => message.id), ['offline'])
+  await bridge.stop()
+
+  t.mock.timers.tick(1000)
+  assert.equal(Object.keys((await stored()).mediaDownloads).length, 1)
+  const restarted = createHarness(dataDir).bridge
+  await restarted.start()
+  assert.deepEqual((await stored()).mediaDownloads, {})
+  await assert.rejects(restarted.getMedia({ chatId, messageId: 'offline' }), /unavailable/)
+  await restarted.stop()
 })

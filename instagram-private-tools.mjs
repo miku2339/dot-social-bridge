@@ -83,7 +83,7 @@ export async function callInstagramPrivateTool({ name, args, bridge, media, medi
 }
 
 function result(value) {
-  const structuredContent = value && typeof value === "object" ? value : { result: value };
+  const structuredContent = value && typeof value === "object" && !Array.isArray(value) ? value : { result: value };
   return { content: [{ type: "text", text: JSON.stringify(structuredContent) }], structuredContent, isError: false };
 }
 function integer(value, fallback, maximum) {

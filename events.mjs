@@ -63,9 +63,8 @@ export class EventSubscriptions {
       lastDeliveryError: null,
     };
     this.started = false;
-    this.stopping = false;
+    this.stateLoaded = false;
     this.processing = false;
-    this.drainPromise = null;
     this.timer = null;
     this.persistChain = Promise.resolve();
     this.stateChain = Promise.resolve();
@@ -254,7 +253,19 @@ export class EventSubscriptions {
   }
 
   async start() {
-    if (this.started) return;
+    await this.#serializeState(async () => {
+      if (this.started) return;
+      await this.#loadIfNeeded();
+      this.#removeExpired(this.now());
+      this.#pruneSeen(this.now());
+      await this.#persist();
+      this.started = true;
+      this.#schedule();
+    });
+  }
+
+  async #loadIfNeeded() {
+    if (this.stateLoaded) return;
     await fs.mkdir(this.dataDir, { recursive: true, mode: 0o700 });
     await fs.chmod(this.dataDir, 0o700);
     try {
@@ -268,25 +279,19 @@ export class EventSubscriptions {
         throw error;
       }
     }
-    this.#removeExpired(this.now());
-    this.#pruneSeen(this.now());
-    this.started = true;
-    this.stopping = false;
-    await this.#persist();
-    this.#schedule();
+    this.stateLoaded = true;
   }
 
   async stop() {
-    this.stopping = true;
-    this.started = false;
-    if (this.timer) clearTimeout(this.timer);
-    this.timer = null;
-    if (this.drainPromise) await this.drainPromise;
     await this.#serializeState(async () => {
+      this.started = false;
+      if (this.timer) clearTimeout(this.timer);
+      this.timer = null;
+      if (!this.stateLoaded) return;
       await this.#persist();
       this.persistenceDirty = false;
+      this.stateLoaded = false;
     });
-    await this.persistChain;
   }
 
   stats() {
@@ -352,7 +357,7 @@ export class EventSubscriptions {
   }
 
   #schedule() {
-    if (!this.started || this.stopping || this.processing) return;
+    if (!this.started || this.processing) return;
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
     const deadlines = [
@@ -365,21 +370,18 @@ export class EventSubscriptions {
     const delay = Math.max(0, next - this.now());
     this.timer = setTimeout(() => {
       this.timer = null;
-      this.drainPromise = this.#drain()
-        .catch((error) => this.logger.error?.({ errorName: error?.name }, "MCP Events queue processing failed"))
-        .finally(() => {
-          this.drainPromise = null;
-        });
+      void this.#drain()
+        .catch((error) => this.logger.error?.({ errorName: error?.name }, "MCP Events queue processing failed"));
     }, delay);
     this.timer.unref?.();
   }
 
   async #drain() {
-    if (this.processing || !this.started || this.stopping) return;
+    if (this.processing || !this.started) return;
     this.processing = true;
     try {
-      while (this.started && !this.stopping) {
-        const processed = await this.#serializeState(() => this.#drainOne());
+      while (true) {
+        const processed = await this.#serializeState(() => this.started && this.#drainOne());
         if (!processed) break;
       }
     } finally {
@@ -408,11 +410,13 @@ export class EventSubscriptions {
     }
 
     if (this.canDeliver) {
-      let allowed = false;
+      let allowed;
       try {
         allowed = await this.canDeliver(item.event.data) === true;
       } catch {
-        allowed = false;
+        this.#retryDelivery(item, index, "permission_check_failed");
+        await this.#persistDrainState();
+        return true;
       }
       if (!allowed) {
         this.queue.splice(index, 1);
@@ -440,17 +444,21 @@ export class EventSubscriptions {
       this.health.failedDeliveries += 1;
       this.health.lastDeliveryError = `http_${result.status}`;
     } else {
-      item.attempts += 1;
-      if (item.attempts >= MAX_ATTEMPTS) {
-        this.queue.splice(currentIndex, 1);
-        this.health.failedDeliveries += 1;
-      } else {
-        item.nextAttemptAt = this.now() + this.retryBaseMs * 2 ** (item.attempts - 1);
-      }
-      this.health.lastDeliveryError = reason;
+      this.#retryDelivery(item, currentIndex, reason);
     }
     await this.#persistDrainState();
     return true;
+  }
+
+  #retryDelivery(item, index, reason) {
+    item.attempts += 1;
+    if (item.attempts >= MAX_ATTEMPTS) {
+      this.queue.splice(index, 1);
+      this.health.failedDeliveries += 1;
+    } else {
+      item.nextAttemptAt = this.now() + this.retryBaseMs * 2 ** (item.attempts - 1);
+    }
+    this.health.lastDeliveryError = reason;
   }
 
   async #persistDrainState() {
@@ -533,6 +541,7 @@ export class EventSubscriptions {
 
   async #commit(mutate) {
     return this.#serializeState(async () => {
+      await this.#loadIfNeeded();
       const candidate = this.#cloneState();
       let changed = false;
       const result = await mutate(candidate, () => { changed = true; });

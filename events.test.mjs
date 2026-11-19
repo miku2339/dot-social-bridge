@@ -327,6 +327,44 @@ test("a successful webhook is not sent again when queue persistence temporarily 
   }
 });
 
+test("orders overlapping start and stop with active and queued deliveries", async () => {
+  const firstDelivery = Promise.withResolvers();
+  const delivered = [];
+  const { manager, cleanup } = await fixture({
+    transport: async (request) => {
+      const event = JSON.parse(request.body);
+      if (event.type === "verification") return echoVerification(request);
+      delivered.push(event.data.id);
+      if (delivered.length === 1) await firstDelivery.promise;
+      return { status: 204 };
+    },
+  });
+  try {
+    await manager.subscribe(subscription([CHAT_A]), "owner");
+    await manager.publish(message({ id: "first" }));
+    await manager.publish(message({ id: "second" }));
+    await Promise.all([manager.start(), manager.stop()]);
+    assert.equal(manager.started, false);
+    assert.equal(manager.stats().pendingDeliveries, 2);
+    assert.deepEqual(delivered, []);
+
+    await manager.start();
+    await waitUntil(() => delivered.length === 1);
+    const stopping = manager.stop();
+    firstDelivery.resolve();
+    await stopping;
+    assert.equal(manager.stats().pendingDeliveries, 1);
+    assert.deepEqual(delivered, ["first"]);
+
+    await Promise.all([manager.stop(), manager.start()]);
+    await waitUntil(() => manager.stats().pendingDeliveries === 0);
+    assert.deepEqual(delivered, ["first", "second"]);
+  } finally {
+    firstDelivery.resolve();
+    await cleanup();
+  }
+});
+
 test("grants finite TTLs with a 24-hour default and seven-day cap", async () => {
   const now = 1_800_000_000_000;
   const context = await fixture({ now: () => now, transport: echoVerification });

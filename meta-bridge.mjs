@@ -915,11 +915,15 @@ export class MetaBridge extends EventEmitter {
         code
       }
     })
-    if (typeof short.access_token !== 'string') throw bridgeError('Instagram authorization result is incomplete', 502)
+    if (short.data !== undefined && (!Array.isArray(short.data) || short.data.length !== 1 || short.access_token !== undefined)) {
+      throw bridgeError('Instagram authorization result is incomplete', 502)
+    }
+    const shortToken = short.data === undefined ? short.access_token : short.data[0]?.access_token
+    if (typeof shortToken !== 'string' || !shortToken) throw bridgeError('Instagram authorization result is incomplete', 502)
     const exchangeUrl = new URL('https://graph.instagram.com/access_token')
     exchangeUrl.searchParams.set('grant_type', 'ig_exchange_token')
     exchangeUrl.searchParams.set('client_secret', platform.config.appSecret)
-    exchangeUrl.searchParams.set('access_token', short.access_token)
+    exchangeUrl.searchParams.set('access_token', shortToken)
     const long = await this.#request(exchangeUrl)
     if (typeof long.access_token !== 'string') throw bridgeError('Instagram token exchange failed', 502)
     const profile = await this.#request('https://graph.instagram.com/me?fields=id,user_id,username', { token: long.access_token })

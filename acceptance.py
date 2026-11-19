@@ -2,6 +2,7 @@
 """Read-only live acceptance using the owner's existing local credential file."""
 
 import base64
+import fcntl
 import hashlib
 import json
 import os
@@ -45,6 +46,39 @@ def request(path, payload=None, form=False, token=None):
         return error
 
 
+def authorize(client, challenge):
+    query = urllib.parse.urlencode({"response_type": "code", "client_id": client, "redirect_uri": REDIRECT, "scope": "whatsapp.read", "state": secrets.token_hex(12), "code_challenge": challenge, "code_challenge_method": "S256", "resource": RESOURCE})
+    return request("/oauth/authorize?" + query)
+
+
+def begin_authorization(challenge):
+    issuer_hash = hashlib.sha256(BASE.encode()).hexdigest()[:24]
+    cache_dir = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "dot-social-bridge"
+    cache_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    cache_path = cache_dir / f"acceptance-client-{issuer_hash}"
+    fd = os.open(cache_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "r+b") as cache:
+        fcntl.flock(cache, fcntl.LOCK_EX)
+        cached = cache.read(129)
+        if re.fullmatch(rb"client_[A-Za-z0-9_-]{32}", cached):
+            client = cached.decode("ascii")
+            response = authorize(client, challenge)
+            if response.status != 401:
+                return client, response
+            with response:
+                if json.load(response).get("error") != "invalid_client":
+                    raise RuntimeError("OAuth authorization failed (401)")
+
+        with request("/oauth/register", {"client_name": "Deployment acceptance", "redirect_uris": [REDIRECT], "token_endpoint_auth_method": "none"}) as response:
+            assert response.status == 201, ("OAuth registration", response.status)
+            client = json.load(response)["client_id"]
+        cache.seek(0)
+        cache.truncate()
+        cache.write(client.encode("ascii"))
+        cache.flush()
+        return client, authorize(client, challenge)
+
+
 def main():
     response = request("/healthz")
     assert response.status == 200 and json.load(response) == {"ok": True}
@@ -52,13 +86,9 @@ def main():
     assert response.status == 401 and "resource_metadata" in response.headers.get("WWW-Authenticate", "")
     metadata = json.load(request("/.well-known/oauth-protected-resource/mcp"))
     assert metadata["resource"] == RESOURCE
-    response = request("/oauth/register", {"client_name": "Deployment acceptance", "redirect_uris": [REDIRECT], "token_endpoint_auth_method": "none"})
-    assert response.status == 201
-    client = json.load(response)["client_id"]
     verifier = secrets.token_urlsafe(48)
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
-    query = urllib.parse.urlencode({"response_type": "code", "client_id": client, "redirect_uri": REDIRECT, "scope": "whatsapp.read", "state": secrets.token_hex(12), "code_challenge": challenge, "code_challenge_method": "S256", "resource": RESOURCE})
-    response = request("/oauth/authorize?" + query)
+    client, response = begin_authorization(challenge)
     assert response.status == 200
     csrf = re.search(r'name="csrf" value="([^"]+)"', response.read().decode()).group(1)
     credential = ADMIN_TOKEN_FILE.read_text().strip()

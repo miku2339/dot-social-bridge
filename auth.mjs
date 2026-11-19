@@ -9,6 +9,7 @@ const MAX_CODES = 100;
 const MAX_TOKENS = 300;
 const MAX_SESSIONS = 10;
 const MAX_CSRF = 100;
+const REFRESH_LIFETIME_MS = 30 * 24 * 60 * 60_000;
 
 export class OAuthError extends Error {
   constructor(code, description, status = 400) {
@@ -273,7 +274,16 @@ export async function createAuthManager(config = {}) {
       if (responses.length !== 1 || responses[0] !== "code") throw new OAuthError("invalid_client_metadata", "response_types 不受支援");
       return mutate(async () => {
         if (Object.keys(state.clients).length >= MAX_CLIENTS) {
-          throw new OAuthError("temporarily_unavailable", "OAuth client 登記數量已達上限", 429);
+          const inUse = new Set([
+            ...Object.values(state.codes), ...Object.values(state.accessTokens), ...Object.values(state.refreshTokens),
+            ...Object.values(state.oauthCsrf).map((pending) => pending.request),
+          ].map((grant) => grant.clientId));
+          const stale = Object.values(state.clients).find((client) =>
+            client.clientName === "Deployment acceptance" && client.redirectUris.length === 1 &&
+            client.redirectUris[0] === "https://chatgpt.com/connector_platform/oauth/callback" &&
+            client.createdAt <= now() - REFRESH_LIFETIME_MS && !inUse.has(client.clientId));
+          if (!stale) throw new OAuthError("temporarily_unavailable", "OAuth client 登記數量已達上限", 429);
+          delete state.clients[stale.clientId];
         }
         const clientId = `client_${secret(24)}`;
         state.clients[clientId] = {
@@ -297,6 +307,7 @@ export async function createAuthManager(config = {}) {
       await mutation;
       const request = normalizeAuthorization(params);
       return mutate(async () => {
+        if (!state.clients[request.clientId]) throw new OAuthError("invalid_client", "OAuth client 不存在", 401);
         const csrf = secret();
         state.oauthCsrf[sha256(csrf)] = {
           request,
@@ -460,7 +471,7 @@ export async function createAuthManager(config = {}) {
       scopes,
       resource: tokenResource,
       createdAt,
-      expiresAt: createdAt + 30 * 24 * 60 * 60_000,
+      expiresAt: createdAt + REFRESH_LIFETIME_MS,
     };
     return {
       access_token: accessToken,

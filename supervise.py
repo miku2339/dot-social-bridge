@@ -21,6 +21,7 @@ MAX_BRIDGE_LOG_LINE = 64 * 1024
 SAFE_BRIDGE_MESSAGES = {
     "Failed to close WhatsApp socket cleanly",
     "Failed to delete chats",
+    "Failed to expire stored WhatsApp messages",
     "Failed to persist chat list",
     "Failed to persist incoming message",
     "Failed to persist WhatsApp credentials",
@@ -107,8 +108,25 @@ def stop_existing():
     try:
         pid = int(PIDFILE.read_text().strip())
         command = Path(f"/proc/{pid}/cmdline").read_bytes()
-        if str(BASE / "supervise.py").encode() in command:
-            os.kill(pid, signal.SIGTERM)
+        if os.fsencode(BASE / "supervise.py") not in command.split(b"\0"):
+            return
+        os.kill(pid, signal.SIGTERM)
+        deadline = time.monotonic() + 40
+        with (SHARED / "supervisor.lock").open("r") as lock:
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return
+                except BlockingIOError:
+                    # A scheduled restart may already own the lock.
+                    try:
+                        if PIDFILE.read_text().strip() != str(pid):
+                            return
+                    except FileNotFoundError:
+                        pass
+                    if time.monotonic() >= deadline:
+                        raise SystemExit("Timed out waiting for supervisor shutdown")
+                    time.sleep(0.1)
     except (FileNotFoundError, ProcessLookupError, ValueError):
         pass
 

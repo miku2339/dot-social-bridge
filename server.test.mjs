@@ -595,7 +595,7 @@ test("pending group replies validate parameters, require read scope, and dispatc
   });
   assert.equal(pending.status, 200);
   const pendingBody = await pending.json();
-  assert.equal(pendingBody.result.structuredContent[0].id, "incoming-1");
+  assert.equal(pendingBody.result.structuredContent.result[0].id, "incoming-1");
   assert.deepEqual(bridge.pendingCalls, [{ scope: "groups", after: 1_700_000_000_000, limit: 20 }]);
 
   const sendGrant = await register(base, "whatsapp.send");

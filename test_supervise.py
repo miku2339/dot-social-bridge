@@ -1,7 +1,39 @@
+import fcntl
 import json
+from pathlib import Path
+import signal
+from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
+import supervise
 from supervise import filter_bridge_log_chunk, filter_bridge_log_line
+
+
+class SupervisorStopTest(unittest.TestCase):
+    def test_stop_waits_for_old_supervisor_to_release_its_lock(self):
+        with TemporaryDirectory() as directory:
+            shared = Path(directory)
+            pidfile = shared / "supervisor.pid"
+            pidfile.write_text("1234")
+            with (shared / "supervisor.lock").open("a") as old_lock:
+                fcntl.flock(old_lock, fcntl.LOCK_EX)
+
+                def finish_shutdown(_delay):
+                    pidfile.unlink()
+                    fcntl.flock(old_lock, fcntl.LOCK_UN)
+
+                with (
+                    patch.object(supervise, "PIDFILE", pidfile),
+                    patch.object(supervise, "SHARED", shared),
+                    patch.object(Path, "read_bytes", return_value=bytes(supervise.BASE / "supervise.py") + b"\0"),
+                    patch.object(supervise.os, "kill") as kill,
+                    patch.object(supervise.time, "sleep", side_effect=finish_shutdown),
+                ):
+                    supervise.stop_existing()
+                kill.assert_called_once_with(1234, signal.SIGTERM)
+                with (shared / "supervisor.lock").open() as new_lock:
+                    fcntl.flock(new_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
 class BridgeLogFilterTest(unittest.TestCase):

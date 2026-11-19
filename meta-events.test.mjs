@@ -216,7 +216,7 @@ test("drops own, history, false-reply and forged Meta messages before delivery",
   }
 });
 
-test("restores pending Meta deliveries and drops them when delivery permission is revoked or cannot be checked", async () => {
+test("drops revoked deliveries and retries unavailable permission checks before sending", async () => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "mcp-meta-events-gate-"));
   const common = {
     platform: "instagram",
@@ -230,27 +230,34 @@ test("restores pending Meta deliveries and drops them when delivery permission i
   await first.stop();
   await first.publish(metaMessage("instagram", { id: "revoked-before-delivery" }));
   await first.publish(metaMessage("instagram", { id: "gate-error-before-delivery", senderId: SENDER_B, chatId: `instagram:${ACCOUNT_A}:${SENDER_B}` }));
+  await first.publish(metaMessage("instagram", { id: "temporarily-unavailable" }));
 
-  const checked = [];
-  let deliveries = 0;
+  const checks = new Map();
+  const delivered = [];
   const second = new MetaEventSubscriptions({
     ...common,
+    retryBaseMs: 5,
     canDeliver(message) {
-      checked.push(message.id);
-      if (message.id === "gate-error-before-delivery") throw new Error("bridge unavailable");
-      return false;
+      const attempts = (checks.get(message.id) ?? 0) + 1;
+      checks.set(message.id, attempts);
+      if (message.id === "revoked-before-delivery") return false;
+      if (message.id === "temporarily-unavailable" && attempts > 1) return true;
+      throw new Error("bridge unavailable");
     },
-    transport: async () => {
-      deliveries += 1;
+    transport: async ({ body }) => {
+      delivered.push(JSON.parse(body).data.id);
       return { status: 204, body: "" };
     },
   });
   try {
     await second.start();
     await waitUntil(() => second.stats().pendingDeliveries === 0);
-    assert.deepEqual(checked.sort(), ["gate-error-before-delivery", "revoked-before-delivery"]);
-    assert.equal(deliveries, 0);
-    assert.equal(second.stats().failedDeliveries, 0);
+    assert.equal(checks.get("revoked-before-delivery"), 1);
+    assert.equal(checks.get("temporarily-unavailable"), 2);
+    assert.equal(checks.get("gate-error-before-delivery"), 5);
+    assert.deepEqual(delivered, ["temporarily-unavailable"]);
+    assert.equal(second.stats().failedDeliveries, 1);
+    assert.equal(second.stats().lastDeliveryError, "permission_check_failed");
   } finally {
     await second.stop().catch(() => {});
     await fs.rm(dataDir, { recursive: true, force: true });

@@ -202,11 +202,18 @@ class WorkerTest(unittest.TestCase):
         self.assertEqual(connected.loaded, [str(self.session)])
 
     def test_poll_normalizes_dm_group_and_ignores_actions(self):
-        image = SimpleNamespace(media_type=1, thumbnail_url="https://cdn.example/private.jpg")
+        from pydantic import HttpUrl
+
+        image = SimpleNamespace(media_type=1, thumbnail_url=HttpUrl("https://cdn.example/private.jpg"))
+        expired_image = SimpleNamespace(media_type=1, thumbnail_url=None)
         client = FakeClient()
         client.threads = [
             thread(messages=[message(), message("reaction", kind="reaction", text="heart"), message("empty", kind="link", text="")]),
-            thread(thread_id="901", group=True, messages=[message("photo", kind="media", text=None, media=image)]),
+            thread(thread_id="901", group=True, messages=[
+                message("expired", kind="media", text=None, media=expired_image),
+                message("photo", kind="media", text=None, media=image),
+                message("caption", kind="media", text="still readable", media=expired_image),
+            ]),
         ]
         client.thread_by_id = {item.id: item for item in client.threads}
         result = self.request(self.worker(client), "poll", limit=2)["result"]
@@ -216,8 +223,11 @@ class WorkerTest(unittest.TestCase):
         self.assertEqual([item["id"] for item in result["threads"][0]["messages"]], ["m1"])
         group = result["threads"][1]
         self.assertEqual(group["memberIds"], [PEER, OTHER, BOT])
+        self.assertEqual([item["id"] for item in group["messages"]], ["photo", "caption"])
         self.assertEqual(group["messages"][0]["mediaType"], "image")
         self.assertEqual(group["messages"][0]["media"]["url"], "https://cdn.example/private.jpg")
+        self.assertIsNone(group["messages"][1]["mediaType"])
+        self.assertEqual(group["messages"][1]["text"], "still readable")
 
     def test_strict_request_bounds_and_thread_membership(self):
         worker = self.worker(FakeClient())

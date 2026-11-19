@@ -12,14 +12,14 @@ function json(data, status = 200) {
   return new Response(body, { status, headers: { 'content-type': 'application/json', 'content-length': String(Buffer.byteLength(body)) } })
 }
 
-function fakeMeta({ failSend = false, sendErrorCode = null } = {}) {
+function fakeMeta({ failSend = false, sendErrorCode = null, instagramTokenResponse } = {}) {
   const calls = []
   const fetchImpl = async (url, options) => {
     const parsed = new URL(url)
     const body = options.body ? String(options.body) : ''
     calls.push({ url: parsed.toString(), options: { ...options, signal: undefined }, body })
     if (parsed.hostname === 'api.instagram.com' && parsed.pathname === '/oauth/access_token') {
-      return json({ access_token: 'ig-short-secret', user_id: 101 })
+      return json(instagramTokenResponse ?? { data: [{ access_token: 'ig-short-secret', user_id: '101' }] })
     }
     if (parsed.hostname === 'graph.instagram.com' && parsed.pathname === '/access_token') {
       return json({ access_token: 'ig-long-secret', expires_in: 5_184_000 })
@@ -236,6 +236,18 @@ test('binds OAuth to one admin session, consumes state once, and keeps credentia
   )
   clock.value += 5_184_000 * 1000
   assert.equal(bridge.getStatus('instagram').status, 'expired')
+})
+
+test('accepts a top-level Instagram token and requires an unambiguous wrapped token', async (t) => {
+  const legacy = await fixture(t, { instagramTokenResponse: { access_token: 'ig-short-secret', user_id: '101' } })
+  assert.equal((await connectInstagram(legacy.bridge)).channels.instagram.status, 'connected')
+
+  const account = { access_token: 'ig-short-secret', user_id: '101' }
+  for (const response of [{ data: [] }, { data: [account, account] }, { ...account, data: [account] }]) {
+    const invalid = await fixture(t, { instagramTokenResponse: response })
+    await assert.rejects(connectInstagram(invalid.bridge), /Instagram authorization result is incomplete/)
+    assert.equal(invalid.calls.length, 1)
+  }
 })
 
 test('lists Facebook Pages privately and verifies the exact selected Page before connecting', async (t) => {

@@ -171,7 +171,7 @@ npm test
   || python3 -m venv "$APP_ROOT/runtime/instagram-venv"
 "$APP_ROOT/runtime/instagram-venv/bin/python" -m pip install \
   -r "$RELEASE_DIR/requirements-instagram.txt"
-python3 -m unittest -v test_supervise.py test_instagram_worker.py
+"$APP_ROOT/runtime/instagram-venv/bin/python" -m unittest discover -v
 ```
 
 すべての Node／Python tests が成功してから切り替えます。
@@ -407,7 +407,9 @@ Dot が実際にファイルの生成または取得に成功してから、メ�
 ```sh
 npm ci
 npm test
-python3 -m unittest -v test_supervise.py test_instagram_worker.py
+python3 -m venv .venv-instagram
+.venv-instagram/bin/python -m pip install -r requirements-instagram.txt
+.venv-instagram/bin/python -m unittest discover -v
 ```
 
 すべての Node／Python tests が成功することを確認します。これはローカルのモック検証であり、実 Instagram のログインや送受信を証明しません。

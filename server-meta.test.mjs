@@ -16,6 +16,7 @@ const WEBHOOK_SECRET = "test-meta-webhook-secret";
 
 function whatsappBridge() {
   return {
+    listChats: () => [],
     ownerIdentities: { ownerIds: new Set(["owner@s.whatsapp.net"]) },
     getQr: () => null,
     getConsoleState: () => ({
@@ -112,6 +113,7 @@ async function fixture(t, { privateInstagram = false } = {}) {
   const events = eventRouter();
   const privateCalls = [];
   const instagramPrivateBridge = privateInstagram ? {
+    listChats: async () => [],
     getConsoleState: () => ({ channel: { status: "not_configured", account: null }, revision: 1, settings: { expectedAccountId: null }, users: [], groups: [] }),
     getStatus: async () => ({ status: "not_configured", account: null }),
     updateConsoleSettings: async (change) => { privateCalls.push(change); },
@@ -364,6 +366,17 @@ test("Meta webhooks preserve exact signed bytes, reject bad HMACs and cap the ra
   });
   assert.equal(oversized.status, 413);
   assert.deepEqual(await oversized.json(), { error: "invalid_request" });
+});
+
+test("chat lists return an MCP result object even when empty", async (t) => {
+  const { base } = await fixture(t, { privateInstagram: true });
+  const access = await token(base, "whatsapp.read instagram.read facebook.read instagram.private.read");
+  for (const prefix of ["whatsapp", "facebook", "instagram", "instagram_private"]) {
+    const response = await rpc(base, access, "tools/call", { name: prefix + "_list_chats", arguments: {} });
+    const { result } = await response.json();
+    assert.deepEqual(result.structuredContent, { result: [] }, prefix);
+    assert.deepEqual(JSON.parse(result.content[0].text), result.structuredContent);
+  }
 });
 
 test("private IG scopes remain independent from official Meta and WhatsApp grants", async (t) => {

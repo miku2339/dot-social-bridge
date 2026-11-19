@@ -71,6 +71,39 @@ test("private IG routes DM/group independently and signs sanitized durable paylo
   }
 });
 
+test("publishing during bridge startup preserves subscriptions and queues until delivery starts", async (t) => {
+  const { events, dataDir } = await fixture(t);
+  await events.subscribe(subscription("dm"), "owner");
+  await events.stop();
+  await events.publish(message("dm", { id: "already-queued" }));
+  await events.stop();
+
+  const checked = [];
+  const delivered = [];
+  const restored = new InstagramPrivateEvents({
+    dataDir,
+    canDeliver: (item) => { checked.push(item.id); return true; },
+    dnsLookup: async () => [{ address: "93.184.216.34", family: 4 }],
+    transport: async ({ body }) => {
+      delivered.push(JSON.parse(body).data.id);
+      return { status: 204 };
+    },
+  });
+  try {
+    assert.deepEqual(await restored.publish(message("dm", { id: "startup-poll" })), { queued: 1, dropped: 0 });
+    const state = JSON.parse(await readFile(join(dataDir, "events-instagram-private-dm-state.json"), "utf8"));
+    assert.equal(state.subscriptions.length, 1);
+    assert.deepEqual(state.queue.map((item) => item.event.data.id), ["already-queued", "startup-poll"]);
+    assert.deepEqual(checked, []);
+    await restored.start();
+    await waitUntil(() => delivered.length === 2);
+    assert.deepEqual(checked, ["already-queued", "startup-poll"]);
+    assert.deepEqual(delivered, checked);
+  } finally {
+    await restored.stop();
+  }
+});
+
 test("private IG event subscriptions reject mixed namespaces and coercible IDs", async (t) => {
   const { events } = await fixture(t);
   for (const args of [{ accountId: 101 }, { accountId: "101", chatIds: ["instagram:101:201"] },

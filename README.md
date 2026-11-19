@@ -171,7 +171,7 @@ npm test
   || python3 -m venv "$APP_ROOT/runtime/instagram-venv"
 "$APP_ROOT/runtime/instagram-venv/bin/python" -m pip install \
   -r "$RELEASE_DIR/requirements-instagram.txt"
-python3 -m unittest -v test_supervise.py test_instagram_worker.py
+"$APP_ROOT/runtime/instagram-venv/bin/python" -m unittest discover -v
 ```
 
 All Node and Python tests must pass before switching releases:
@@ -407,7 +407,9 @@ See [`docs/dot-prompts.en.md`](docs/dot-prompts.en.md) for the complete direct-m
 ```sh
 npm ci
 npm test
-python3 -m unittest -v test_supervise.py test_instagram_worker.py
+python3 -m venv .venv-instagram
+.venv-instagram/bin/python -m pip install -r requirements-instagram.txt
+.venv-instagram/bin/python -m unittest discover -v
 ```
 
 Expected result: every Node and Python test passes. This is local simulated validation and does not establish a real Instagram login or message delivery.

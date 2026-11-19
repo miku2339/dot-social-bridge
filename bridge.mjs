@@ -573,61 +573,76 @@ class BoundedJsonStore {
       }
     }
     this.data = parsed
+    const messageCount = this.data.messages.length
     const mediaKeysBeforePrune = Object.keys(this.data.mediaDownloads).sort().join('\n')
     this.prune()
     if (Object.keys(this.data.mediaDownloads).sort().join('\n') !== mediaKeysBeforePrune) migrated = true
-    return migrated
+    return migrated || messageCount !== this.data.messages.length
   }
 
-  prune(now = Date.now()) {
-    const cutoff = now - this.retentionMs
-    this.data.messages = this.data.messages
-      .filter((message) => Number.isFinite(message.timestamp) && message.timestamp >= cutoff)
+  prune(data = this.data) {
+    const cutoff = Date.now() - this.retentionMs
+    data.messages = data.messages
+      .filter((message) => Number.isFinite(message.timestamp) && message.timestamp > cutoff)
       .sort((a, b) => b.timestamp - a.timestamp)
       .slice(0, this.maxMessages)
 
-    const chats = Object.values(this.data.chats)
+    const chats = Object.values(data.chats)
       .sort((a, b) => b.updatedAt - a.updatedAt)
       .slice(0, this.maxChats)
-    this.data.chats = Object.fromEntries(chats.map((chat) => [chat.id, chat]))
+    data.chats = Object.fromEntries(chats.map((chat) => [chat.id, chat]))
 
-    const idempotency = Object.values(this.data.idempotency)
+    const idempotency = Object.values(data.idempotency)
       .filter((entry) => entry.createdAt >= cutoff)
       .sort((a, b) => b.createdAt - a.createdAt)
       .slice(0, this.maxIdempotency)
-    this.data.idempotency = Object.fromEntries(idempotency.map((entry) => [entry.key, entry]))
+    data.idempotency = Object.fromEntries(idempotency.map((entry) => [entry.key, entry]))
 
-    const mediaKeys = new Set(this.data.messages.map((message) => mediaDownloadKey(message.chatId, message.id)))
-    this.data.mediaDownloads = Object.fromEntries(Object.entries(this.data.mediaDownloads ?? {})
+    const mediaKeys = new Set(data.messages.map((message) => mediaDownloadKey(message.chatId, message.id)))
+    data.mediaDownloads = Object.fromEntries(Object.entries(data.mediaDownloads ?? {})
       .filter(([key, descriptor]) => mediaKeys.has(key) && descriptor && typeof descriptor === 'object' && !Array.isArray(descriptor)))
   }
 
-  async persist() {
-    this.prune()
+  async persist(data = this.data) {
+    const next = { ...data }
+    this.prune(next)
     const temporary = `${this.file}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`
     try {
-      await writeFile(temporary, `${JSON.stringify(this.data)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
+      await writeFile(temporary, `${JSON.stringify(next)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
+      await chmod(temporary, 0o600)
       await rename(temporary, this.file)
-      await chmod(this.file, 0o600)
+      this.data = next
     } catch (error) {
       await unlink(temporary).catch(() => {})
       throw error
     }
   }
 
-  putMessage(message, chatName) {
-    const duplicate = this.data.messages.findIndex((item) => item.id === message.id && item.chatId === message.chatId)
-    if (duplicate >= 0) this.data.messages.splice(duplicate, 1)
-    this.data.messages.unshift(message)
-    const existing = this.data.chats[message.chatId]
-    this.data.chats[message.chatId] = {
+  putMessage(message, chatName, data = this.data) {
+    const duplicate = data.messages.findIndex((item) => item.id === message.id && item.chatId === message.chatId)
+    if (duplicate >= 0) data.messages[duplicate] = message
+    else data.messages.unshift(message)
+    const existing = data.chats[message.chatId]
+    data.chats[message.chatId] = {
       id: message.chatId,
       name: chatName || existing?.name || null,
       updatedAt: message.timestamp,
       lastMessage: message.text?.slice(0, 160) || (message.mediaType ? `[${message.mediaType}]` : null)
     }
-    this.prune()
     return duplicate < 0
+  }
+
+  async storeIncoming(message, chatName, descriptor) {
+    const next = {
+      ...this.data,
+      messages: [...this.data.messages],
+      chats: { ...this.data.chats },
+      mediaDownloads: { ...this.data.mediaDownloads }
+    }
+    const inserted = this.putMessage(message, chatName, next)
+    if (descriptor) next.mediaDownloads[mediaDownloadKey(message.chatId, message.id)] = descriptor
+    await this.persist(next)
+    return inserted
   }
 
   putChat(chat) {
@@ -638,7 +653,6 @@ class BoundedJsonStore {
       updatedAt: chat.updatedAt ?? existing?.updatedAt ?? Date.now(),
       lastMessage: existing?.lastMessage ?? null
     }
-    this.prune()
   }
 
   deleteChats(chatIds) {
@@ -653,19 +667,22 @@ class BoundedJsonStore {
   }
 
   getMessages(chatId, limit, before) {
-    let messages = this.data.messages.filter((message) => message.chatId === chatId)
+    const cutoff = Date.now() - this.retentionMs
+    let messages = this.data.messages.filter((message) => message.chatId === chatId && message.timestamp > cutoff)
     if (before !== undefined && before !== null && before !== '') {
-      const cursorMessage = messages.find((message) => message.id === before)
-      let cursor = cursorMessage?.timestamp
-      if (cursor === undefined) {
-        const numeric = typeof before === 'number' ? before : Number(before)
+      const index = messages.findIndex((message) => message.id === before)
+      if (index >= 0) {
+        messages = messages.slice(index + 1)
+      } else {
+        const numeric = Number(before)
+        let cursor
         if (Number.isFinite(numeric) && numeric > 0) cursor = numeric < 1_000_000_000_000 ? numeric * 1000 : numeric
         else if (typeof before === 'string') cursor = Date.parse(before)
+        if (!Number.isFinite(cursor)) throw new TypeError('before must be a message ID or timestamp')
+        messages = messages.filter((message) => message.timestamp < cursor)
       }
-      if (!Number.isFinite(cursor)) throw new TypeError('before must be a message ID or timestamp')
-      messages = messages.filter((message) => message.timestamp < cursor)
     }
-    return messages.sort((a, b) => b.timestamp - a.timestamp).slice(0, limit).map((message) => ({ ...message }))
+    return messages.slice(0, limit).map((message) => ({ ...message }))
   }
 
   findTextMessage(key) {
@@ -675,10 +692,6 @@ class BoundedJsonStore {
 
   getMediaDownload(chatId, messageId) {
     return this.data.mediaDownloads[mediaDownloadKey(chatId, messageId)] ?? null
-  }
-
-  putMediaDownload(chatId, messageId, descriptor) {
-    this.data.mediaDownloads[mediaDownloadKey(chatId, messageId)] = descriptor
   }
 }
 
@@ -728,6 +741,7 @@ export class WhatsAppBridge extends EventEmitter {
     this.generation = 0
     this.reconnectAttempt = 0
     this.reconnectTimer = null
+    this.retentionTimer = null
     this.mutationQueue = Promise.resolve()
     this.sendQueue = Promise.resolve()
     this.authSaveQueue = Promise.resolve()
@@ -766,6 +780,7 @@ export class WhatsAppBridge extends EventEmitter {
       this.paired = credentialsArePaired(auth.state)
       await this._hardenAuthFiles()
       await this._connect()
+      this._scheduleRetention()
       return this.getStatus()
     } catch (error) {
       this.started = false
@@ -781,6 +796,8 @@ export class WhatsAppBridge extends EventEmitter {
     this.generation += 1
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
     this.reconnectTimer = null
+    clearTimeout(this.retentionTimer)
+    this.retentionTimer = null
     this.groupMetadataCache.clear()
     const socket = this.socket
     this.socket = null
@@ -972,6 +989,7 @@ export class WhatsAppBridge extends EventEmitter {
 
     const message = this.store.data.messages.find((item) => (
       item.id === messageId
+      && item.timestamp > Date.now() - this.store.retentionMs
       && item.chatId === chatId
       && item.direction === 'incoming'
       && item.fromMe === false
@@ -1213,6 +1231,13 @@ export class WhatsAppBridge extends EventEmitter {
     return operation
   }
 
+  _reserveSend(entry) {
+    return this._queueStoreWrite(() => this.store.persist({
+      ...this.store.data,
+      idempotency: { ...this.store.data.idempotency, [entry.key]: entry }
+    }))
+  }
+
   async _sendTextLocked({ chatId, text, idempotencyKey }) {
     if (!this.started || this.status !== 'connected' || !this.socket) {
       throw new Error('WhatsApp is not connected')
@@ -1243,9 +1268,7 @@ export class WhatsAppBridge extends EventEmitter {
         status: 'pending',
         createdAt: Date.now()
       }
-      await this._mutateStore(() => {
-        this.store.data.idempotency[idempotencyKey] = entry
-      })
+      await this._reserveSend(entry)
     }
 
     if (isAutomaticReply) this._validateAutomaticReplyPolicy(source, chatId)
@@ -1308,9 +1331,7 @@ export class WhatsAppBridge extends EventEmitter {
         status: 'pending',
         createdAt: Date.now()
       }
-      await this._mutateStore(() => {
-        this.store.data.idempotency[idempotencyKey] = entry
-      })
+      await this._reserveSend(entry)
     }
 
     if (isAutomaticReply) this._validateAutomaticReplyPolicy(source, chatId)
@@ -1370,9 +1391,7 @@ export class WhatsAppBridge extends EventEmitter {
         status: 'pending',
         createdAt: Date.now()
       }
-      await this._mutateStore(() => {
-        this.store.data.idempotency[idempotencyKey] = entry
-      })
+      await this._reserveSend(entry)
     }
 
     const seconds = kind === 'video' ? mp4DurationSeconds(media) : null
@@ -1760,11 +1779,9 @@ export class WhatsAppBridge extends EventEmitter {
         _replyTo: replyTo
       }
       normalized.senderRole = senderRoleForMessage(normalized, this.ownerIdentities.ownerIds)
-      const isNew = await this._mutateStore(() => {
-        const inserted = this.store.putMessage(normalized, normalized.pushName)
-        if (mediaDownload) this.store.putMediaDownload(normalized.chatId, normalized.id, mediaDownload)
-        return inserted
-      })
+      const isNew = await this._queueStoreWrite(() => (
+        this.store.storeIncoming(normalized, isGroup ? null : normalized.pushName, mediaDownload)
+      ))
       if (!isNew) continue
       if (!this.accessPolicy.valid || !this.accessPolicy.autoReplyEnabled) continue
       const replyCutoff = isGroup
@@ -1795,14 +1812,37 @@ export class WhatsAppBridge extends EventEmitter {
     })
   }
 
-  async _mutateStore(mutator) {
+  _scheduleRetention(minDelay = 1) {
+    clearTimeout(this.retentionTimer)
+    this.retentionTimer = null
+    const oldest = this.store.data.messages.at(-1)
+    if (!this.started || !oldest) return
+    const delay = Math.max(minDelay, oldest.timestamp + this.store.retentionMs - Date.now())
+    this.retentionTimer = setTimeout(() => {
+      this._queueStoreWrite(() => this.store.persist()).catch((error) => {
+        this._logError('Failed to expire stored WhatsApp messages', error)
+        this._scheduleRetention(60_000)
+      })
+    }, Math.min(delay, 2_147_483_647))
+    this.retentionTimer.unref?.()
+  }
+
+  _queueStoreWrite(write) {
     const operation = this.mutationQueue.then(async () => {
-      const result = mutator()
-      await this.store.persist()
+      const result = await write()
+      this._scheduleRetention()
       return result
     })
     this.mutationQueue = operation.catch(() => {})
     return operation
+  }
+
+  _mutateStore(mutator) {
+    return this._queueStoreWrite(async () => {
+      const result = mutator()
+      await this.store.persist()
+      return result
+    })
   }
 
   async _hardenAuthFiles() {
